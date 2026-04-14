@@ -24,6 +24,13 @@ from projects.occ_plugin.occupancy.apis.test import custom_single_gpu_test, cust
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
+import copyreg
+
+def pickle_dict_keys(k):
+    return list, (list(k),)
+
+copyreg.pickle(type({}.keys()), pickle_dict_keys)
+copyreg.pickle(type({}.values()), pickle_dict_keys)
 
 
 def parse_args():
@@ -93,7 +100,10 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    # torch.distributed.launch injects --local_rank, newer torchrun may pass
+    # --local-rank; accept both to avoid argparse errors.
+    parser.add_argument(
+        '--local_rank', '--local-rank', dest='local_rank', type=int, default=0)
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)

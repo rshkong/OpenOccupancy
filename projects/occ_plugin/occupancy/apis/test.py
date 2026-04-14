@@ -65,7 +65,7 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
             result = model(return_loss=False, rescale=True, **data)
 
             if show:
-                save_occ(result['pred_c'], result['pred_f'], data['img_metas'], out_dir, data['visible_mask'], data['gt_occ'])
+                save_occ(result['pred_c'], result['pred_f'], data['img_metas'], out_dir, data.get('visible_mask'), data.get('gt_occ'))
             
             # only support semantic voxel segmentation
             if 'SC_metric' in result.keys():
@@ -139,7 +139,7 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False, sh
             result = model(return_loss=False, rescale=True, **data)
 
             if show:
-                save_occ(result['pred_c'], result['pred_f'], data['img_metas'], out_dir, data['visible_mask'], data['gt_occ'])
+                save_occ(result['pred_c'], result['pred_f'], data['img_metas'], out_dir, data.get('visible_mask'), data.get('gt_occ'))
             
             if 'SC_metric' in result.keys():
                 SC_metric.append(result['SC_metric'])

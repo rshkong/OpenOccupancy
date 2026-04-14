@@ -1,5 +1,4 @@
 cd $(readlink -f `dirname $0`)
-conda activate OpenOccupancy
 
 echo $1
 if [ -f $1 ]; then

@@ -29,6 +29,13 @@ from mmdet.apis import set_random_seed
 
 from mmcv.utils import TORCH_VERSION, digit_version
 from projects.occ_plugin.occupancy.apis.train import custom_train_model
+import copyreg
+
+def pickle_dict_keys(k):
+    return list, (list(k),)
+
+copyreg.pickle(type({}.keys()), pickle_dict_keys)
+copyreg.pickle(type({}.values()), pickle_dict_keys)
 
 
 def parse_args():
@@ -80,7 +87,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     parser.add_argument(
         '--autoscale-lr',
         action='store_true',

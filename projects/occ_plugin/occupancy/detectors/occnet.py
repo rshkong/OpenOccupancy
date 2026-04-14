@@ -13,7 +13,7 @@ import copy
 
 @DETECTORS.register_module()
 class OccNet(BEVDepth):
-    def __init__(self, 
+    def __init__(self,
             loss_cfg=None,
             disable_loss_depth=False,
             empty_idx=0,
@@ -23,11 +23,11 @@ class OccNet(BEVDepth):
             loss_norm=False,
             **kwargs):
         super().__init__(**kwargs)
-                
+
         self.loss_cfg = loss_cfg
         self.disable_loss_depth = disable_loss_depth
         self.loss_norm = loss_norm
-        
+
         self.record_time = False
         self.time_stats = collections.defaultdict(list)
         self.empty_idx = empty_idx

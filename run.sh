@@ -1,5 +1,5 @@
 cd $(readlink -f `dirname $0`)
-conda activate OpenOccupancy
+# conda activate OpenOccupancy
 export PYTHONPATH="."
 
 echo $1

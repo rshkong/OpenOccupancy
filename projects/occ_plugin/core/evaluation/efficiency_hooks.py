@@ -21,7 +21,7 @@ class OccEfficiencyHook(Hook):
         input = dict(
             img_metas=img_metas,
         )
-        if 'img_inputs' in m_info.keys():
+        if 'img_inputs' in list(m_info.keys()):
             img_inputs = m_info['img_inputs']
             for i in range(len(img_inputs)):
                 if isinstance(img_inputs[i], list):

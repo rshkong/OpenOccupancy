@@ -3,6 +3,8 @@
 projects/configs/dev
 run2.sh
 run_a100.sh
+visualization_results/
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

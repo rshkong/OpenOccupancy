@@ -1,2 +1,3 @@
 from .ViewTransformerLSSBEVDepth import ViewTransformerLSSBEVDepth
 from .ViewTransformerLSSVoxel import ViewTransformerLiftSplatShootVoxel
+from .ViewTransformerLSSFlash import ViewTransformerLSSFlash
