@@ -200,7 +200,7 @@ train_config=dict(
         box_type_3d='LiDAR'),
 
 data = dict(
-    samples_per_gpu=1,
+    samples_per_gpu=3,
     workers_per_gpu=2,
     train=train_config,
     val=test_config,

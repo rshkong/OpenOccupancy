@@ -40,6 +40,11 @@ bash tools/dist_test.sh projects/configs/baselines/CAM-R50_img1600_128x128x10.py
 *   `--show`: 激活测试时的可视化/保存钩子逻辑，也就是触发你修改过的 `show_occ.py`。
 *   `--show-dir`: 你希望把生成的 `.npy` 保存到哪个根目录下。建议像示例中那样带上 checkpoin 版本信息（如 `latest_epoch1`），这样结果就不会互相覆盖。
 
+**`dist_test.sh` 的作用可以简洁理解为：**
+*   不加 `--show` 时：主要用于跑完整个测试集并输出评估结果（如 `SC` / `SSC` 指标）。
+*   加上 `--show --show-dir` 时：除了前向推理，还会把预测结果保存出来，便于后续可视化。
+*   默认不会像训练那样生成大量 checkpoint 或 TensorBoard 曲线，主要输出是终端文本；只有你显式加保存参数时才会额外落盘。
+
 > 💡 **提示**：如果你发现输出文件夹里只有 `pred_c.npy` 和 `pred_f.npy`，而没有 Ground Truth 真值（`gt.npy`），别忘了打开配置文件（`CAM-R50_img256x704_...py`），在文件接近末尾的 `test_pipeline` 字典列表里，把包含 `type='OccDefaultFormatBundle3D'` 那一行的 `with_label=False` 改为 `with_label=True`。
 
 ---
@@ -168,6 +173,55 @@ python tools/show_npy.py visualization_results/author_baseline/任意scene_token
     *   **ESC 或 Q 键**：关闭并退出当前的 3D 查看器。
 *   
 
+---
 
+### 4. 如何验证模型并查看 SC / SSC 指标
+
+使用官方提供的分布式测试脚本 `dist_test.sh`，不给 `--show` 时，它主要会执行评估流程并在终端 / 日志中输出 `SC`、`SSC_mean` 和各类别 `SSC_*` 指标。
+
+**通用命令格式：**
+```bash
+bash tools/dist_test.sh <配置文件路径> <权重文件路径> <GPU数量>
+```
+
+**实际调用示例：**
+
+**① 验证原版 baseline（CAM-R50, 256×704）**
+```bash
+bash tools/dist_test.sh projects/configs/baselines/CAM-R50_img256x704_128x128x10_4070ti.py \
+    work_dirs/cam_r50_256x704/latest.pth 1
+```
+
+**② 验证我们自己的 FLC-Occ Step 2**
+```bash
+bash tools/dist_test.sh projects/configs/baselines/CAM-R50_img256x704_flc_step2_128x128x10_4070ti.py \
+    work_dirs/CAM-R50_img256x704_flc_step2_128x128x10_4070ti/latest.pth 1
+```
+
+**③ 把评估输出同时保存成文本日志**
+```bash
+bash tools/dist_test.sh projects/configs/baselines/CAM-R50_img256x704_128x128x10_4070ti.py \
+    work_dirs/cam_r50_256x704/latest.pth 1 | tee baseline_eval.log
+```
+
+**参数说明：**
+*   **配置文件路径**：必须和该 checkpoint 训练时使用的 config 对应，否则网络结构或数据处理流程可能不匹配。
+*   **权重文件路径**：通常填 `latest.pth`、`best_*.pth` 或某个 `epoch_*.pth`。
+*   **GPU数量**：本地单卡验证一般填 `1`。
+
+**你会在输出里看到什么：**
+*   `SC_non-empty`：Scene Completion 指标，只看“空 / 非空”，不区分类别。
+*   `SSC_mean`：Semantic Scene Completion 的总体平均指标，通常是最重要的主指标。
+*   `SSC_car`、`SSC_barrier`、`SSC_pedestrian` 等：各类别的语义占据指标，数值越高越好。
+
+**如何理解这种验证方式：**
+*   这是一次性评估，默认主要输出到终端和文本日志。
+*   它不像训练过程那样自动生成完整的 TensorBoard `val/*` 曲线卡片。
+*   如果只是想补做 baseline 的验证，这种方式最直接、最稳妥。
+
+**建议优先看的指标：**
+*   `SC_non-empty`：判断几何 completion 能不能学到。
+*   `SSC_mean`：判断整体语义 occupancy 效果。
+*   `SSC_car`、`SSC_barrier`、`SSC_pedestrian`：判断关键类别是否真的有提升。
 
 
