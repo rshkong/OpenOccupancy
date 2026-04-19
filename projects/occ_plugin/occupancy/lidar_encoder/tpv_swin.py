@@ -1,0 +1,513 @@
+# Copyright (c) OpenMMLab. All rights reserved.
+# Ported from PointOcc/model/swin.py to OpenOccupancy (mmdet2/mmcv1).
+# Changes: mmengine imports → mmcv.runner / mmcv.cnn equivalents,
+#          registry MODELS → BACKBONES, PatchEmbed/PatchMerging from mmdet.
+import warnings
+import logging
+from collections import OrderedDict
+from copy import deepcopy
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as cp
+from mmcv.cnn import build_norm_layer
+from mmcv.cnn.bricks.transformer import FFN, build_dropout
+from mmcv.runner import BaseModule, load_checkpoint
+from mmcv.cnn.utils.weight_init import constant_init, trunc_normal_, trunc_normal_init
+from mmcv.utils import to_2tuple
+
+from mmdet3d.models.builder import BACKBONES
+from mmdet.models.backbones.swin import PatchEmbed, PatchMerging
+
+
+class WindowMSA(BaseModule):
+    def __init__(self, embed_dims, num_heads, window_size,
+                 qkv_bias=True, qk_scale=None,
+                 attn_drop_rate=0., proj_drop_rate=0., init_cfg=None):
+        super().__init__()
+        self.embed_dims = embed_dims
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_embed_dims = embed_dims // num_heads
+        self.scale = qk_scale or head_embed_dims ** -0.5
+        self.init_cfg = init_cfg
+
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1),
+                        num_heads))
+
+        Wh, Ww = self.window_size
+        rel_index_coords = self.double_step_seq(2 * Ww - 1, Wh, 1, Ww)
+        rel_position_index = rel_index_coords + rel_index_coords.T
+        rel_position_index = rel_position_index.flip(1).contiguous()
+        self.register_buffer('relative_position_index', rel_position_index)
+
+        self.qkv = nn.Linear(embed_dims, embed_dims * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop_rate)
+        self.proj = nn.Linear(embed_dims, embed_dims)
+        self.proj_drop = nn.Dropout(proj_drop_rate)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def init_weights(self):
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def forward(self, x, mask=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
+                                  C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.view(-1)].view(
+                self.window_size[0] * self.window_size[1],
+                self.window_size[0] * self.window_size[1], -1)
+        relative_position_bias = relative_position_bias.permute(
+            2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B // nW, nW, self.num_heads, N,
+                             N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+        attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    @staticmethod
+    def double_step_seq(step1, len1, step2, len2):
+        seq1 = torch.arange(0, step1 * len1, step1)
+        seq2 = torch.arange(0, step2 * len2, step2)
+        return (seq1[:, None] + seq2[None, :]).reshape(1, -1)
+
+
+class ShiftWindowMSA(BaseModule):
+    def __init__(self, embed_dims, num_heads, window_size,
+                 shift_size=0, qkv_bias=True, qk_scale=None,
+                 attn_drop_rate=0, proj_drop_rate=0,
+                 dropout_layer=dict(type='DropPath', drop_prob=0.),
+                 init_cfg=None):
+        super().__init__(init_cfg)
+        self.window_size = window_size
+        self.shift_size = shift_size
+        assert 0 <= self.shift_size < self.window_size
+
+        self.w_msa = WindowMSA(
+            embed_dims=embed_dims, num_heads=num_heads,
+            window_size=to_2tuple(window_size),
+            qkv_bias=qkv_bias, qk_scale=qk_scale,
+            attn_drop_rate=attn_drop_rate,
+            proj_drop_rate=proj_drop_rate, init_cfg=None)
+        self.drop = build_dropout(dropout_layer)
+
+    def forward(self, query, hw_shape):
+        B, L, C = query.shape
+        H, W = hw_shape
+        assert L == H * W, 'input feature has wrong size'
+        query = query.view(B, H, W, C)
+
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        query = F.pad(query, (0, 0, 0, pad_r, 0, pad_b))
+        H_pad, W_pad = query.shape[1], query.shape[2]
+
+        if self.shift_size > 0:
+            shifted_query = torch.roll(
+                query, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            img_mask = torch.zeros((1, H_pad, W_pad, 1), device=query.device)
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            mask_windows = self.window_partition(img_mask)
+            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(
+                attn_mask != 0, float(-100.0)).masked_fill(
+                    attn_mask == 0, float(0.0))
+        else:
+            shifted_query = query
+            attn_mask = None
+
+        query_windows = self.window_partition(shifted_query)
+        query_windows = query_windows.view(-1, self.window_size ** 2, C)
+        attn_windows = self.w_msa(query_windows, mask=attn_mask)
+        attn_windows = attn_windows.view(
+            -1, self.window_size, self.window_size, C)
+
+        shifted_x = self.window_reverse(attn_windows, H_pad, W_pad)
+        if self.shift_size > 0:
+            x = torch.roll(
+                shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+
+        if pad_r > 0 or pad_b:
+            x = x[:, :H, :W, :].contiguous()
+
+        x = x.view(B, H * W, C)
+        x = self.drop(x)
+        return x
+
+    def window_reverse(self, windows, H, W):
+        window_size = self.window_size
+        B = int(windows.shape[0] / (H * W / window_size / window_size))
+        x = windows.view(B, H // window_size, W // window_size,
+                         window_size, window_size, -1)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+        return x
+
+    def window_partition(self, x):
+        B, H, W, C = x.shape
+        window_size = self.window_size
+        x = x.view(B, H // window_size, window_size,
+                   W // window_size, window_size, C)
+        windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+        windows = windows.view(-1, window_size, window_size, C)
+        return windows
+
+
+class SwinBlock(BaseModule):
+    def __init__(self, embed_dims, num_heads, feedforward_channels,
+                 window_size=7, shift=False, qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+                 act_cfg=dict(type='GELU'), norm_cfg=dict(type='LN'),
+                 with_cp=False, init_cfg=None):
+        super(SwinBlock, self).__init__()
+        self.init_cfg = init_cfg
+        self.with_cp = with_cp
+
+        self.norm1 = build_norm_layer(norm_cfg, embed_dims)[1]
+        self.attn = ShiftWindowMSA(
+            embed_dims=embed_dims, num_heads=num_heads,
+            window_size=window_size,
+            shift_size=window_size // 2 if shift else 0,
+            qkv_bias=qkv_bias, qk_scale=qk_scale,
+            attn_drop_rate=attn_drop_rate, proj_drop_rate=drop_rate,
+            dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
+            init_cfg=None)
+
+        self.norm2 = build_norm_layer(norm_cfg, embed_dims)[1]
+        self.ffn = FFN(
+            embed_dims=embed_dims,
+            feedforward_channels=feedforward_channels,
+            num_fcs=2, ffn_drop=drop_rate,
+            dropout_layer=dict(type='DropPath', drop_prob=drop_path_rate),
+            act_cfg=act_cfg, add_identity=True, init_cfg=None)
+
+    def forward(self, x, hw_shape):
+        def _inner_forward(x):
+            identity = x
+            x = self.norm1(x)
+            x = self.attn(x, hw_shape)
+            x = x + identity
+            identity = x
+            x = self.norm2(x)
+            x = self.ffn(x, identity=identity)
+            return x
+
+        if self.with_cp and x.requires_grad:
+            x = cp.checkpoint(_inner_forward, x, use_reentrant=False)
+        else:
+            x = _inner_forward(x)
+        return x
+
+
+class SwinBlockSequence(BaseModule):
+    def __init__(self, embed_dims, num_heads, feedforward_channels, depth,
+                 window_size=7, qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+                 downsample=None, act_cfg=dict(type='GELU'),
+                 norm_cfg=dict(type='LN'), with_cp=False, init_cfg=None):
+        super().__init__(init_cfg=init_cfg)
+
+        if isinstance(drop_path_rate, list):
+            drop_path_rates = drop_path_rate
+            assert len(drop_path_rates) == depth
+        else:
+            drop_path_rates = [deepcopy(drop_path_rate) for _ in range(depth)]
+
+        self.blocks = nn.ModuleList()
+        for i in range(depth):
+            block = SwinBlock(
+                embed_dims=embed_dims, num_heads=num_heads,
+                feedforward_channels=feedforward_channels,
+                window_size=window_size,
+                shift=False if i % 2 == 0 else True,
+                qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
+                drop_path_rate=drop_path_rates[i],
+                act_cfg=act_cfg, norm_cfg=norm_cfg,
+                with_cp=with_cp, init_cfg=None)
+            self.blocks.append(block)
+        self.downsample = downsample
+
+    def forward(self, x, hw_shape):
+        for block in self.blocks:
+            x = block(x, hw_shape)
+        if self.downsample:
+            x_down, down_hw_shape = self.downsample(x, hw_shape)
+            return x_down, down_hw_shape, x, hw_shape
+        else:
+            return x, hw_shape, x, hw_shape
+
+
+@BACKBONES.register_module()
+class TPVSwin(BaseModule):
+    """Swin Transformer backbone for TPV planes.
+
+    Ported from PointOcc. Processes 3 TPV planes through shared Swin stages.
+    Returns list of 3 lists, each containing multi-scale features.
+    """
+
+    def __init__(self,
+                 pretrain_img_size=224,
+                 in_channels=64,
+                 embed_dims=96,
+                 patch_size=4,
+                 window_size=7,
+                 mlp_ratio=4,
+                 depths=(2, 2, 6, 2),
+                 num_heads=(3, 6, 12, 24),
+                 strides=(4, 2, 2, 2),
+                 out_indices=(0, 1, 2, 3),
+                 qkv_bias=True,
+                 qk_scale=None,
+                 patch_norm=True,
+                 drop_rate=0.,
+                 attn_drop_rate=0.,
+                 drop_path_rate=0.1,
+                 use_abs_pos_embed=False,
+                 act_cfg=dict(type='GELU'),
+                 norm_cfg=dict(type='LN'),
+                 with_cp=False,
+                 pretrained=None,
+                 convert_weights=False,
+                 frozen_stages=-1,
+                 init_cfg=None):
+        self.convert_weights = convert_weights
+        self.frozen_stages = frozen_stages
+        self.pretrained = pretrained
+        if isinstance(pretrain_img_size, int):
+            pretrain_img_size = to_2tuple(pretrain_img_size)
+        elif isinstance(pretrain_img_size, tuple):
+            if len(pretrain_img_size) == 1:
+                pretrain_img_size = to_2tuple(pretrain_img_size[0])
+            assert len(pretrain_img_size) == 2
+
+        assert not (init_cfg and pretrained), \
+            'init_cfg and pretrained cannot be specified at the same time'
+        if isinstance(pretrained, str):
+            warnings.warn('DeprecationWarning: pretrained is deprecated, '
+                          'please use "init_cfg" instead')
+            self.init_cfg = dict(type='Pretrained', checkpoint=pretrained)
+        elif pretrained is None:
+            self.init_cfg = init_cfg
+        else:
+            raise TypeError('pretrained must be a str or None')
+
+        super(TPVSwin, self).__init__(init_cfg=init_cfg)
+
+        num_layers = len(depths)
+        self.out_indices = out_indices
+        self.use_abs_pos_embed = use_abs_pos_embed
+
+        self.patch_embed_lidar = PatchEmbed(
+            in_channels=in_channels,
+            embed_dims=embed_dims,
+            conv_type='Conv2d',
+            kernel_size=patch_size,
+            stride=strides[0],
+            norm_cfg=norm_cfg if patch_norm else None,
+            init_cfg=None)
+
+        if self.use_abs_pos_embed:
+            patch_row = pretrain_img_size[0] // patch_size
+            patch_col = pretrain_img_size[1] // patch_size
+            num_patches = patch_row * patch_col
+            self.absolute_pos_embed = nn.Parameter(
+                torch.zeros((1, num_patches, embed_dims)))
+
+        self.drop_after_pos = nn.Dropout(p=drop_rate)
+
+        total_depth = sum(depths)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, total_depth)]
+
+        self.stages = nn.ModuleList()
+        in_channels_stage = embed_dims
+        for i in range(num_layers):
+            if i < num_layers - 1:
+                downsample = PatchMerging(
+                    in_channels=in_channels_stage,
+                    out_channels=2 * in_channels_stage,
+                    stride=strides[i + 1],
+                    norm_cfg=norm_cfg if patch_norm else None,
+                    init_cfg=None)
+            else:
+                downsample = None
+
+            stage = SwinBlockSequence(
+                embed_dims=in_channels_stage,
+                num_heads=num_heads[i],
+                feedforward_channels=mlp_ratio * in_channels_stage,
+                depth=depths[i],
+                window_size=window_size,
+                qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
+                drop_path_rate=dpr[sum(depths[:i]):sum(depths[:i + 1])],
+                downsample=downsample,
+                act_cfg=act_cfg, norm_cfg=norm_cfg,
+                with_cp=with_cp, init_cfg=None)
+            self.stages.append(stage)
+            if downsample:
+                in_channels_stage = downsample.out_channels
+
+        self.num_features = [int(embed_dims * 2 ** i) for i in range(num_layers)]
+        for i in out_indices:
+            layer = build_norm_layer(norm_cfg, self.num_features[i])[1]
+            layer_name = f'norm{i}'
+            self.add_module(layer_name, layer)
+
+    def train(self, mode=True):
+        super(TPVSwin, self).train(mode)
+        self._freeze_stages()
+
+    def _freeze_stages(self):
+        if self.frozen_stages >= 0:
+            self.patch_embed_lidar.eval()
+            for param in self.patch_embed_lidar.parameters():
+                param.requires_grad = False
+            if self.use_abs_pos_embed:
+                self.absolute_pos_embed.requires_grad = False
+            self.drop_after_pos.eval()
+
+        for i in range(1, self.frozen_stages + 1):
+            if (i - 1) in self.out_indices:
+                norm_layer = getattr(self, f'norm{i - 1}')
+                norm_layer.eval()
+                for param in norm_layer.parameters():
+                    param.requires_grad = False
+            m = self.stages[i - 1]
+            m.eval()
+            for param in m.parameters():
+                param.requires_grad = False
+
+    def init_weights(self):
+        logger = logging.getLogger(__name__)
+        if self.pretrained is None and self.init_cfg is None:
+            logger.warning(f'No pre-trained weights for {self.__class__.__name__}, '
+                           f'training start from scratch')
+            if self.use_abs_pos_embed:
+                trunc_normal_(self.absolute_pos_embed, std=0.02)
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    trunc_normal_init(m, std=.02, bias=0.)
+                elif isinstance(m, nn.LayerNorm):
+                    constant_init(m, 1.0)
+        else:
+            ckpt_path = self.pretrained
+            if ckpt_path is None and self.init_cfg is not None:
+                ckpt_path = self.init_cfg.get('checkpoint', None)
+            if ckpt_path is None:
+                return
+
+            ckpt = load_checkpoint(self, ckpt_path, map_location='cpu',
+                                   strict=False, logger=logger)
+
+    def forward(self, x_3view):
+        """Process 3 TPV planes through shared Swin stages.
+
+        Args:
+            x_3view: list of 3 tensors, each [B, C, H, W]
+
+        Returns:
+            list of 3 lists, each containing multi-scale feature maps
+        """
+        x_tpv, hw_shape_tpv = [], []
+        for x in x_3view:
+            x, hw_shape = self.patch_embed_lidar(x)
+            if self.use_abs_pos_embed:
+                x = x + self.absolute_pos_embed
+            x = self.drop_after_pos(x)
+            x_tpv.append(x)
+            hw_shape_tpv.append(hw_shape)
+
+        outs = [[], [], []]
+        for i, stage in enumerate(self.stages):
+            for j in range(len(x_tpv)):
+                x_tpv[j], hw_shape_tpv[j], out, out_hw_shape = stage(
+                    x_tpv[j], hw_shape_tpv[j])
+                if i in self.out_indices:
+                    norm_layer = getattr(self, f'norm{i}')
+                    out = norm_layer(out)
+                    out = out.view(-1, *out_hw_shape,
+                                   self.num_features[i]).permute(0, 3, 1, 2).contiguous()
+                    outs[j].append(out)
+
+        return outs
+
+
+def swin_converter(ckpt):
+    new_ckpt = OrderedDict()
+
+    def correct_unfold_reduction_order(x):
+        out_channel, in_channel = x.shape
+        x = x.reshape(out_channel, 4, in_channel // 4)
+        x = x[:, [0, 2, 1, 3], :].transpose(1, 2).reshape(out_channel, in_channel)
+        return x
+
+    def correct_unfold_norm_order(x):
+        in_channel = x.shape[0]
+        x = x.reshape(4, in_channel // 4)
+        x = x[[0, 2, 1, 3], :].transpose(0, 1).reshape(in_channel)
+        return x
+
+    for k, v in ckpt.items():
+        if k.startswith('head'):
+            continue
+        elif k.startswith('layers'):
+            new_v = v
+            if 'attn.' in k:
+                new_k = k.replace('attn.', 'attn.w_msa.')
+            elif 'mlp.' in k:
+                if 'mlp.fc1.' in k:
+                    new_k = k.replace('mlp.fc1.', 'ffn.layers.0.0.')
+                elif 'mlp.fc2.' in k:
+                    new_k = k.replace('mlp.fc2.', 'ffn.layers.1.')
+                else:
+                    new_k = k.replace('mlp.', 'ffn.')
+            elif 'downsample' in k:
+                new_k = k
+                if 'reduction.' in k:
+                    new_v = correct_unfold_reduction_order(v)
+                elif 'norm.' in k:
+                    new_v = correct_unfold_norm_order(v)
+            else:
+                new_k = k
+            new_k = new_k.replace('layers', 'stages', 1)
+        elif k.startswith('patch_embed'):
+            new_v = v
+            if 'proj' in k:
+                new_k = k.replace('proj', 'projection')
+            else:
+                new_k = k
+        else:
+            new_v = v
+            new_k = k
+        new_ckpt['backbone.' + new_k] = new_v
+
+    return new_ckpt

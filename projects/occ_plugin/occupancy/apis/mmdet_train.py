@@ -59,6 +59,10 @@ def custom_train_detector(model,
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False,
             find_unused_parameters=find_unused_parameters)
+        # Enable static graph for models that reuse parameters in a single
+        # forward pass (e.g. shared lidar_neck called 3x for TPV planes).
+        if cfg.get('static_graph', False):
+            model._set_static_graph()
     else:
         model = MMDataParallel(
             model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)

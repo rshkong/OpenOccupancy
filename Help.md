@@ -143,6 +143,8 @@ bash tools/dist_train.sh projects/configs/baselines/CAM-R50_img256x704_flc_step2
 - 平时快速看训练是否正常：先看 `.log`
 - 想画更细的 loss / lr 曲线：看 `.log.json` 或 TensorBoard 的 `tf_logs/`
 - 想恢复训练或做推理：看 `latest.pth`、`epoch_*.pth`、`best_*.pth`
+- 使用如下方式打开tensorboard
+  `tensorboard --logdir_spec baseline:/home/shkong/MyProject/OpenOccupancy/work_dirs/cam_r50_256x704/tf_logs,flashocc:/home/shkong/MyProject/OpenOccupancy/work_dirs/CAM-R50_img256x704_flc_step2_128x128x10_4070ti/tf_logs --port 6006`
 
 ---
 
@@ -223,5 +225,84 @@ bash tools/dist_test.sh projects/configs/baselines/CAM-R50_img256x704_128x128x10
 *   `SC_non-empty`：判断几何 completion 能不能学到。
 *   `SSC_mean`：判断整体语义 occupancy 效果。
 *   `SSC_car`、`SSC_barrier`、`SSC_pedestrian`：判断关键类别是否真的有提升。
+
+---
+
+### 5. 如何对模型做前向推理性能分析（耗时 / 显存）
+
+使用 `tools/profile_model.py` 脚本，对模型做纯推理 profiling，输出每个子模块的平均耗时和显存占用情况，不需要真实数据集，用随机 dummy 输入即可。
+
+**通用命令格式：**
+```bash
+python tools/profile_model.py [--config <配置文件>] [--checkpoint <权重文件>] [可选参数]
+```
+
+**常用参数说明：**
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--config` | FLC-Occ Step2 config | 模型配置文件路径 |
+| `--checkpoint` | FLC-Occ latest.pth | 权重文件路径 |
+| `--mode` | `full` | `extract`：只跑到 occ encoder；`full`：跑到 occ head 输出 |
+| `--warmup` | `10` | 预热帧数，不计入统计（让 CUDA 进入稳定状态） |
+| `--measure` | `50` | 正式统计帧数，越大结果越稳定 |
+| `--batch-size` | `1` | batch size |
+| `--seed` | `0` | 随机种子，保证 dummy 输入可复现 |
+
+**实际调用示例：**
+
+**① 快速测试 FLC-Occ Step2 的推理性能（默认参数）**
+```bash
+python tools/profile_model.py
+```
+
+**② 测试指定 checkpoint，减少 measure 次数快速得到结果**
+```bash
+python tools/profile_model.py \
+    --checkpoint work_dirs/CAM-R50_img256x704_flc_step2_128x128x10_4070ti/best_SSC_mean_epoch_15.pth \
+    --warmup 5 --measure 20
+```
+
+**③ 只测到 occ encoder（不跑 head），对比 BEV 特征提取的瓶颈**
+```bash
+python tools/profile_model.py --mode extract --measure 20
+```
+
+**④ 测试原版 baseline 的推理性能做对比**
+```bash
+python tools/profile_model.py \
+    --config projects/configs/baselines/CAM-R50_img256x704_128x128x10_4070ti.py \
+    --checkpoint work_dirs/cam_r50_256x704/latest.pth \
+    --warmup 5 --measure 20
+```
+
+**输出说明：**
+
+```
+========================================================================
+Pure Forward Profiling (image -> occupancy logits)
+avg forward : XX.XX ms        ← 端到端平均耗时
+fps         : X.XX            ← 理论帧率
+peak memory : X.XX GB         ← 推理过程峰值显存
+
+Stage                Avg Time (ms)     Share
+------------------------------------------------
+img_encoder              XX.XX         XX.X%   ← 图像骨干 + FPN
+view_transformer         XX.XX         XX.X%   ← LSS Lift-Splat + 深度估计
+occ_encoder              XX.XX         XX.X%   ← BEV backbone + FPN_LSS
+occ_head                 XX.XX         XX.X%   ← Conv2d + C2H MLP
+
+Stage                Alloc Delta     Stage Peak Delta      Alloc After
+------------------------------------------------------------------------
+img_encoder            X.XX GB            X.XX GB           X.XX GB
+view_transformer       X.XX GB            X.XX GB           X.XX GB
+occ_encoder            X.XX GB            X.XX GB           X.XX GB
+occ_head               X.XX GB            X.XX GB           X.XX GB
+```
+
+*   **Avg Time / Share**：每个模块的平均耗时和占总耗时的比例，用于定位时间瓶颈。
+*   **Alloc Delta**：该阶段净分配的显存（正值 = 分配，负值 = 释放）。
+*   **Stage Peak Delta**：该阶段内峰值显存相对阶段开始时的增量，反映该模块的最大显存需求。
+*   **Alloc After**：该阶段结束后的显存占用绝对值。
 
 

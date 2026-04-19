@@ -5,3 +5,4 @@ from .image2bev import *
 from .voxel_encoder import *
 from .necks import *
 from .fuser import *
+from .lidar_encoder import *

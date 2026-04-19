@@ -3,19 +3,20 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 # ============================================================
-# FLC-Occ Step 2: Channel-to-Height (C2H) 恢复高度维度
+# FLC-PointOcc: Camera (FLC) + LiDAR (PointOcc TPV) fusion
 #
-# 相比 Step 1 (flash2d) 的改动:
-#   - pts_bbox_head: OccHead  →  FLCOccHead
-#     * 移除 unsqueeze Z=1 的 workaround (use_2d_encoder=False)
-#     * C2H MLP 直接将 [B, 640, 128, 128] → [B, 17, 128, 128, 10]
-#     * 输出有完整的 Z 维度，与 gt_occ 对齐，loss 直接监督
-#   - occ_encoder_backbone / neck: 与 Step 1 完全相同 (CustomResNet2D + FPN_LSS)
-#   - LiDAR mask / fine branch: 留待 Step 3/4
+# Two-branch architecture:
+#   Camera: img → ResNet50 → SECONDFPN → ViewTransformerLSSFlash
+#           → BEV [B, 640, 128, 128] → cam_adapter → [B, 320, 128, 128]
+#   LiDAR:  points → CylinderEncoder → TPVSwin → TPVFPN → TPVFuser
+#           → 3D feat [B, 192, 128, 128, 10] → Linear(192→64)
+#           → flatten Z → [B, 640, 128, 128] → lidar_adapter → [B, 320, 128, 128]
+#   Fusion: cat → [B, 640, 128, 128] → fuse_conv → [B, 640, 128, 128]
+#           → CustomResNet2D → FPN_LSS → FLCOccHead
 # ============================================================
 
 input_modality = dict(
-    use_lidar=False,
+    use_lidar=True,
     use_camera=True,
     use_radar=False,
     use_map=False,
@@ -41,7 +42,7 @@ num_cls = 17
 visible_mask = False
 img_norm_cfg = None
 
-# CONet fine branch — disabled until Step 4
+# CONet fine branch — disabled
 cascade_ratio = 4
 sample_from_voxel = False
 sample_from_img = False
@@ -70,23 +71,45 @@ grid_config = {
     'dbound': [2.0, 58.0, 0.5],
 }
 
-# Channel dimension bookkeeping
-# Dz = 8.0 m / 0.8 m = 10 height bins
-numC_Trans = 64   #单一高度分层的特征通道数
+# ---- Channel bookkeeping ----
+numC_Trans = 64   # per-height-bin channel count
 Dz = 10
-bev_channels = numC_Trans * Dz          # 640 → input to CustomResNet2D
+bev_channels = numC_Trans * Dz          # 640
 
-bev_num_channels = [128, 256, 512]      # stage output channels
-fpn_in_channels = bev_num_channels[0] + bev_num_channels[2]   # 128+512=640
-voxel_out_channel = 256                 # FPN_LSS output channels
+# Encoder backbone
+bev_num_channels = [128, 256, 512]
+fpn_in_channels = bev_num_channels[0] + bev_num_channels[2]   # 640
+voxel_out_channel = 256
 
-# FLCOccHead: Conv2d output dim and MLP hidden dim (matches FlashOcc BEVOCCHead2D)
+# FLCOccHead
 c2h_conv_out_dim = 256
 c2h_hidden_dim = 512
 
+# LiDAR TPV branch
+tpv_C = 192          # Swin FPN output channels per TPV plane
+lidar_proj_out = 64  # project 192 → 64 before Z-flatten
+# After flatten: 64 * 10 = 640
+
+# Adapter: each branch 640→320, cat→640
+cam_adapter_out = 320
+lidar_adapter_out = 320
+
+# Cylindrical grid (for CylinderEncoder) — halved from PointOcc [480,360,32] for VRAM
+cyl_grid_size = [240, 180, 16]
+
+# TPV plane sizes (CylinderEncoder output)
+# After pool with split=[4,4,4]: tpv_xy=(240,180), tpv_yz=(180,16), tpv_zx=(16,240)
+# With Swin patch_size=4, stride=[1,2,2,2]:
+#   patch_embed: (60,45) / (45,4) / (4,60)
+# TPV dim params for TPVFuser
+tpv_w = 240 // 4   # After Swin patch_embed with patch_size=4 and FPN upsample
+tpv_h = 180 // 4
+tpv_z = 16 // 4
+
 model = dict(
-    type='OccNet',
+    type='FLCPointOccNet',
     loss_norm=False,
+    # ---- Camera branch (same as FLC) ----
     img_backbone=dict(
         pretrained='torchvision://resnet50',
         type='ResNet',
@@ -112,7 +135,102 @@ model = dict(
         data_config=data_config,
         numC_Trans=numC_Trans,
         vp_megvii=False),
-    # 2D BEV backbone: [B, 640, 128, 128] → multi-scale
+    # ---- LiDAR branch ----
+    lidar_tokenizer=dict(
+        type='CylinderEncoder',
+        grid_size=cyl_grid_size,
+        in_channels=10,
+        out_channels=128,
+        fea_compre=None,
+        base_channels=128,
+        split=[4, 4, 4],
+        track_running_stats=False,
+    ),
+    lidar_backbone=dict(
+        type='TPVSwin',
+        in_channels=128,
+        embed_dims=96,
+        depths=[2, 2, 6, 2],
+        num_heads=[3, 6, 12, 24],
+        window_size=7,
+        mlp_ratio=4,
+        patch_size=4,
+        strides=[1, 2, 2, 2],
+        frozen_stages=-1,
+        qkv_bias=True,
+        qk_scale=None,
+        drop_rate=0.,
+        attn_drop_rate=0.,
+        drop_path_rate=0.2,
+        patch_norm=True,
+        out_indices=[1, 2, 3],
+        with_cp=True,
+        convert_weights=True,
+        # pretrained='pretrain/swin_tiny_patch4_window7_224.pth',
+    ),
+    lidar_neck=dict(
+        type='TPVFPN',
+        in_channels=[192, 384, 768],
+        out_channels=tpv_C,
+        start_level=0,
+        num_outs=3,
+        norm_cfg=dict(type='BN2d', requires_grad=True),
+        act_cfg=dict(type='ReLU', inplace=True),
+        upsample_cfg=dict(mode='bilinear', align_corners=False),
+    ),
+    tpv_fuser=dict(
+        type='TPVFuser',
+        tpv_h=tpv_h,
+        tpv_w=tpv_w,
+        tpv_z=tpv_z,
+        grid_size_occ=[128, 128, 10],
+        coarse_ratio=1,
+        scale_h=2,
+        scale_w=2,
+        scale_z=2,
+    ),
+    # ---- Channel adapters and fusion ----
+    lidar_proj_in=tpv_C,         # 192
+    lidar_proj_out=lidar_proj_out,  # 64
+    lidar_Dz=Dz,                 # 10
+    cam_adapter_cfg=dict(
+        in_channels=bev_channels,     # 640
+        out_channels=cam_adapter_out,  # 320
+        kernel_size=1,
+        stride=1,
+        padding=0,
+        bias=False,
+        norm_cfg=dict(type='BN'),
+        act_cfg=dict(type='ReLU'),
+    ),
+    lidar_adapter_cfg=dict(
+        in_channels=lidar_proj_out * Dz,  # 640
+        out_channels=lidar_adapter_out,    # 320
+        kernel_size=1,
+        stride=1,
+        padding=0,
+        bias=False,
+        norm_cfg=dict(type='BN'),
+        act_cfg=dict(type='ReLU'),
+    ),
+    fuse_conv_cfg=dict(
+        in_channels=cam_adapter_out + lidar_adapter_out,  # 640
+        out_channels=bev_channels,  # 640
+        kernel_size=1,
+        stride=1,
+        padding=0,
+        bias=False,
+        norm_cfg=dict(type='BN'),
+        act_cfg=dict(type='ReLU'),
+    ),
+    fused_channels=bev_channels,  # 640
+    # Cylindrical grid config
+    cyl_grid_size=cyl_grid_size,
+    cyl_min_bound=[0.0, -3.14159265, -5.0],
+    cyl_max_bound=[50.0, 3.14159265, 3.0],
+    occ_grid_size=[128, 128, 10],
+    occ_coarse_ratio=1,
+    # ---- 2D Encoder backbone ----
     occ_encoder_backbone=dict(
         type='CustomResNet2D',
         numC_input=bev_channels,
@@ -123,7 +241,6 @@ model = dict(
         norm_cfg=dict(type='BN', requires_grad=True),
         with_cp=True,
     ),
-    # 2D FPN neck: → [B, 256, 128, 128]
     occ_encoder_neck=dict(
         type='FPN_LSS',
         in_channels=fpn_in_channels,
@@ -133,17 +250,15 @@ model = dict(
         norm_cfg=dict(type='BN', requires_grad=True),
         extra_upsample=2,
     ),
-    # FLCOccHead: Conv2d + C2H MLP → [B, 17, 128, 128, 10]
+    # ---- FLC OccHead ----
     pts_bbox_head=dict(
         type='FLCOccHead',
-        # Conv2d + C2H 参数 (matches FlashOcc BEVOCCHead2D)
-        in_channels=voxel_out_channel,  # 256, FPN_LSS 输出
-        out_channel=num_cls,            # 17
-        Dz=Dz,                          # 10
-        conv_out_dim=c2h_conv_out_dim,  # 256, Conv2d output
-        hidden_dim=c2h_hidden_dim,      # 512, MLP hidden
+        in_channels=voxel_out_channel,
+        out_channel=num_cls,
+        Dz=Dz,
+        conv_out_dim=c2h_conv_out_dim,
+        hidden_dim=c2h_hidden_dim,
         norm_cfg_2d=dict(type='BN'),
-        # 继承自 OccHead 的参数
         norm_cfg=dict(type='SyncBN', requires_grad=True),
         cascade_ratio=cascade_ratio,
         sample_from_voxel=sample_from_voxel,
@@ -170,30 +285,47 @@ bda_aug_conf = dict(
     flip_dy_ratio=0.5)
 
 train_pipeline = [
-    dict(type='LoadMultiViewImageFromFiles_BEVDet', is_train=True, data_config=data_config,
-         sequential=False, aligned=True, trans_only=False, depth_gt_path=depth_gt_path,
+    dict(type='LoadPointsFromFile',
+         coord_type='LIDAR',
+         load_dim=5,
+         use_dim=5),
+    dict(type='LoadPointsFromMultiSweeps',
+         sweeps_num=10),
+    dict(type='LoadMultiViewImageFromFiles_BEVDet', is_train=True,
+         data_config=data_config, sequential=False, aligned=True,
+         trans_only=False, depth_gt_path=depth_gt_path,
          mmlabnorm=True, load_depth=True, img_norm_cfg=img_norm_cfg),
     dict(type='LoadAnnotationsBEVDepth',
-         bda_aug_conf=bda_aug_conf, classes=class_names, input_modality=input_modality),
-    dict(type='LoadOccupancy', to_float32=True, use_semantic=True, occ_path=occ_path,
-         grid_size=occ_size, use_vel=False, unoccupied=empty_idx,
-         pc_range=point_cloud_range, cal_visible=visible_mask),
+         bda_aug_conf=bda_aug_conf, classes=class_names,
+         input_modality=input_modality),
+    dict(type='LoadOccupancy', to_float32=True, use_semantic=True,
+         occ_path=occ_path, grid_size=occ_size, use_vel=False,
+         unoccupied=empty_idx, pc_range=point_cloud_range,
+         cal_visible=visible_mask),
     dict(type='OccDefaultFormatBundle3D', class_names=class_names),
-    dict(type='Collect3D', keys=['img_inputs', 'gt_occ']),
+    dict(type='Collect3D', keys=['img_inputs', 'gt_occ', 'points']),
 ]
 
 test_pipeline = [
+    dict(type='LoadPointsFromFile',
+         coord_type='LIDAR',
+         load_dim=5,
+         use_dim=5),
+    dict(type='LoadPointsFromMultiSweeps',
+         sweeps_num=10),
     dict(type='LoadMultiViewImageFromFiles_BEVDet', data_config=data_config,
          depth_gt_path=depth_gt_path, sequential=False, aligned=True,
          trans_only=False, mmlabnorm=True, img_norm_cfg=img_norm_cfg),
     dict(type='LoadAnnotationsBEVDepth',
          bda_aug_conf=bda_aug_conf, classes=class_names,
          input_modality=input_modality, is_train=False),
-    dict(type='LoadOccupancy', to_float32=True, use_semantic=True, occ_path=occ_path,
-         grid_size=occ_size, use_vel=False, unoccupied=empty_idx,
-         pc_range=point_cloud_range, cal_visible=visible_mask),
-    dict(type='OccDefaultFormatBundle3D', class_names=class_names, with_label=False),
-    dict(type='Collect3D', keys=['img_inputs', 'gt_occ'],
+    dict(type='LoadOccupancy', to_float32=True, use_semantic=True,
+         occ_path=occ_path, grid_size=occ_size, use_vel=False,
+         unoccupied=empty_idx, pc_range=point_cloud_range,
+         cal_visible=visible_mask),
+    dict(type='OccDefaultFormatBundle3D', class_names=class_names,
+         with_label=False),
+    dict(type='Collect3D', keys=['img_inputs', 'gt_occ', 'points'],
          meta_keys=['pc_range', 'occ_size', 'scene_token', 'lidar_token']),
 ]
 
@@ -224,7 +356,7 @@ train_config = dict(
     box_type_3d='LiDAR')
 
 data = dict(
-    samples_per_gpu=5,
+    samples_per_gpu=1,
     workers_per_gpu=2,
     train=train_config,
     val=test_config,
@@ -254,6 +386,8 @@ lr_config = dict(
     min_lr_ratio=1e-3)
 
 runner = dict(type='EpochBasedRunner', max_epochs=30)
+find_unused_parameters = False
+static_graph = True
 evaluation = dict(
     interval=1,
     pipeline=test_pipeline,
@@ -262,5 +396,6 @@ evaluation = dict(
 )
 
 custom_hooks = [
-    dict(type='OccEfficiencyHook'),
+    # OccEfficiencyHook disabled — deepcopy model wastes ~400MB VRAM
+    # dict(type='OccEfficiencyHook'),
 ]

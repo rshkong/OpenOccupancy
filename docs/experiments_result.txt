@@ -1,0 +1,59 @@
+========================================================================
+Pure Forward Profiling (image -> occupancy logits)
+config      : projects/configs/baselines/CAM-R50_img256x704_flc_step2_128x128x10_4070ti.py
+checkpoint  : work_dirs/CAM-R50_img256x704_flc_step2_128x128x10_4070ti/best_SSC_mean_epoch_15.pth
+mode        : full
+input shape : img=(1, 6, 3, 256, 704)
+warmup      : 5
+measure     : 50
+avg forward : 35.48 ms
+fps         : 28.19
+peak memory : 0.45 GB
+========================================================================
+
+Stage                 Avg Time (ms)     Share
+------------------------------------------------
+img_encoder                  16.20     47.2%
+view_transformer             11.95     34.8%
+occ_encoder                   4.87     14.2%
+occ_head                      1.32      3.9%
+
+Stage                   Alloc Delta   Stage Peak Delta    Alloc After
+------------------------------------------------------------------------
+img_encoder                 0.02 GB            0.25 GB        0.32 GB
+view_transformer            0.04 GB            0.26 GB        0.36 GB
+occ_encoder                 0.02 GB            0.12 GB        0.38 GB
+occ_head                    0.01 GB            0.08 GB        0.39 GB
+
+Loaded checkpoint epoch: 15
+
+
+
+========================================================================
+Pure Forward Profiling (image -> occupancy logits)
+config      : projects/configs/baselines/CAM-R50_img256x704_128x128x10_4070ti.py
+checkpoint  : work_dirs/cam_r50_256x704/latest.pth
+mode        : full
+input shape : img=(1, 6, 3, 256, 704)
+warmup      : 5
+measure     : 50
+avg forward : 82.38 ms
+fps         : 12.14
+peak memory : 0.97 GB
+========================================================================
+
+Stage                 Avg Time (ms)     Share
+------------------------------------------------
+img_encoder                  15.99     19.7%
+view_transformer             12.02     14.8%
+occ_encoder                  36.73     45.2%
+occ_head                     16.51     20.3%
+
+Stage                   Alloc Delta   Stage Peak Delta    Alloc After
+------------------------------------------------------------------------
+img_encoder                 0.02 GB            0.25 GB        0.41 GB
+view_transformer            0.05 GB            0.32 GB        0.46 GB
+occ_encoder                 0.18 GB            0.55 GB        0.64 GB
+occ_head                    0.01 GB            0.33 GB        0.65 GB
+
+Loaded checkpoint epoch: 10
