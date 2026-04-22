@@ -92,11 +92,15 @@ def custom_single_gpu_test(model, data_loader, show=False, out_dir=None, show_sc
         prog_bar.update()
 
 
-    res = {
-        'SC_metric': SC_metric,
-        'SSC_metric': SSC_metric,
-        'SSC_metric_fine': SSC_metric_fine,
-    }
+    # Wrap in lists to match multi-GPU format expected by dataset.evaluate()
+    # (which calls sum(results['SC_metric']) — a list of 2D arrays, not a raw 2D array).
+    res = {}
+    if not np.isscalar(SC_metric) or SC_metric != 0:
+        res['SC_metric'] = [SC_metric]
+    if not np.isscalar(SSC_metric) or SSC_metric != 0:
+        res['SSC_metric'] = [SSC_metric]
+    if not np.isscalar(SSC_metric_fine) or SSC_metric_fine != 0:
+        res['SSC_metric_fine'] = [SSC_metric_fine]
 
     return res
 

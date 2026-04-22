@@ -20,27 +20,11 @@ FLC-PointOcc 是一个双模态（Camera + LiDAR）融合架构，结合了 Flas
 │    → ViewTransformerLSSFlash                          │
 │    → cam_bev [B, 640, 128, 128]                      │
 │    → cam_adapter (Conv2d 1x1 + BN + ReLU)            │
-│    → [B, 320, 128, 128]                              │
+│    → cam_feat [B, 320, 128, 128]                     │
 │                                                       │
 └────────────────────────┬──────────────────────────────┘
-                         │ cat (dim=1)
-                         ↓
-                   [B, 640, 128, 128]
                          │
-                   fuse_conv (Conv2d 1x1 + BN + ReLU)
                          │
-                   [B, 640, 128, 128]
-                         │
-                   CustomResNet2D (occ_encoder_backbone)
-                         │
-                   FPN_LSS (occ_encoder_neck)
-                         │
-                   [B, 256, 128, 128]
-                         │
-                   FLCOccHead (Conv2d + C2H MLP)
-                         │
-                   [B, 17, 128, 128, 10]   ← 最终语义占据预测
-                         ↑ cat (dim=1)
 ┌─────────────────── LiDAR Branch ─────────────────────┐
 │                                                       │
 │  points [B, N, 5]  (x, y, z, intensity, ring)       │
@@ -63,9 +47,29 @@ FLC-PointOcc 是一个双模态（Camera + LiDAR）融合架构，结合了 Flas
 │    → flatten Z (reshape)                              │
 │    → [B, 640, 128, 128]                              │
 │    → lidar_adapter (Conv2d 1x1 + BN + ReLU)          │
-│    → [B, 320, 128, 128]                              │
+│    → lidar_feat [B, 320, 128, 128]                   │
 │                                                       │
-└───────────────────────────────────────────────────────┘
+└────────────────────────┬──────────────────────────────┘
+                         │
+                         ↓
+        cat([cam_feat, lidar_feat], dim=1)
+                         ↓
+              fusion_input [B, 640, 128, 128]
+                         │
+              fuse_conv (Conv2d 1x1 + BN + ReLU)
+                         │
+              fused_bev [B, 640, 128, 128]
+                         │
+              CustomResNet2D (occ_encoder_backbone)
+                         │
+              FPN_LSS (occ_encoder_neck)
+                         │
+              [B, 256, 128, 128]
+                         │
+              FLCOccHead (Conv2d + C2H MLP)
+                         │
+              output_voxels [B, 17, 128, 128, 10]
+              # 最终语义占据 logits，不参与 cat
 ```
 
 ### 1.2 逐阶段详解
@@ -162,7 +166,6 @@ TPV 将 3D 空间分解为三个正交的 2D 平面：
 | `torch_scatter` | CylinderEncoder 中的 scatter_max 点云聚合 | `pip install torch_scatter -f https://data.pyg.org/whl/torch-2.0.1+cu118.html` |
 
 ---
-
 ## 3. 训练方法
 
 ### 3.1 启动训练
@@ -171,9 +174,8 @@ TPV 将 3D 空间分解为三个正交的 2D 平面：
 conda activate OpenOccupancy-4070
 
 # 单GPU训练
-python tools/train.py \
-    projects/configs/baselines/CAM-LiDAR_flc_pointocc_128x128x10_4070ti.py \
-    --work-dir work_dirs/flc_pointocc
+ PYTHONPATH="./":$PYTHONPATH python tools/train.py projects/configs/baselines/CAM-LiDAR_flc_pointocc_128x128x10_4070ti.py --seed 0
+
 
 # 分布式训练 (如有多GPU)
 bash tools/dist_train.sh \
