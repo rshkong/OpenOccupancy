@@ -63,8 +63,14 @@ class FLCPointOccNet(OccNet):
                  cyl_max_bound=None,
                  occ_grid_size=None,
                  occ_coarse_ratio=1,
+                 # Debug flags
+                 debug_zero_lidar=False,
                  **kwargs):
         super().__init__(**kwargs)
+
+        # When True, zeros lidar_feat before fusion → degrades to pure camera (FlashOcc).
+        # Use to verify fusion path has no bug before debugging fusion quality.
+        self.debug_zero_lidar = debug_zero_lidar
 
         # ---- LiDAR feature extraction ----
         self.lidar_tokenizer = builder.build_backbone(lidar_tokenizer)
@@ -206,6 +212,10 @@ class FLCPointOccNet(OccNet):
         else:
             # Camera-only fallback: zero lidar features
             lidar_feat = torch.zeros_like(cam_feat)
+
+        # === Step 1 degrade switch: zero LiDAR → pure FlashOcc behaviour ===
+        if self.debug_zero_lidar:
+            lidar_feat = torch.zeros_like(lidar_feat)
 
         if self.record_time:
             torch.cuda.synchronize()
