@@ -192,7 +192,15 @@ class FLCPointOccNet(OccNet):
 
         pts_feats = None
         if points is not None:
-            grid_ind, voxels_coarse = self._prepare_lidar_inputs(points)
+            # Derive TPV sampling shape from the fuser so voxels_coarse is
+            # scaled consistently with the grid_sample normalization inside.
+            tpv_norm_shape = [
+                int(self.tpv_fuser.tpv_w * self.tpv_fuser.scale_w),
+                int(self.tpv_fuser.tpv_h * self.tpv_fuser.scale_h),
+                int(self.tpv_fuser.tpv_z * self.tpv_fuser.scale_z),
+            ]
+            grid_ind, voxels_coarse = self._prepare_lidar_inputs(
+                points, tpv_norm_shape=tpv_norm_shape)
             tpv_list = self.extract_lidar_tpv(points, grid_ind)
             lidar_3d = self.tpv_fuser(tpv_list, voxels_coarse)
             # lidar_3d: [B, C_tpv, X, Y, Z]
@@ -252,16 +260,23 @@ class FLCPointOccNet(OccNet):
         phi = torch.atan2(xyz[:, :, 1], xyz[:, :, 0])
         return torch.stack([rho, phi, xyz[:, :, 2]], dim=-1)
 
-    def _prepare_lidar_inputs(self, points):
+    def _prepare_lidar_inputs(self, points, tpv_norm_shape=None):
         """Generate cylindrical grid_ind and voxels_coarse from raw points.
 
         Args:
             points: list of (N_i, 5) tensors [x, y, z, intensity, ring]
                     or (B, N, 5) padded tensor
+            tpv_norm_shape: optional (3,) iterable giving the effective TPV
+                sampling resolution [W_tpv*scale_w, H_tpv*scale_h, Z_tpv*scale_z].
+                When provided, voxels_coarse is scaled to [0, tpv_norm_shape)
+                so that TPVFuser/TPVAggregator's `coord / dim * 2 - 1`
+                round-trips to [-1, 1].  When None, falls back to grid-index
+                space [0, cyl_grid_size) — matches the legacy convention and
+                only works when cyl_grid_size == tpv_norm_shape.
 
         Returns:
             grid_ind: list of B tensors, each (N_i, 3) int32
-            voxels_coarse: (B, M, 3) float — cylindrical coords of
+            voxels_coarse: (B, M, 3) float — cylindrical grid coords of
                            coarse Cartesian voxel centres
         """
         device = points[0].device if isinstance(points, list) else points.device
@@ -340,7 +355,17 @@ class FLCPointOccNet(OccNet):
 
         # Normalise to cylindrical grid coordinates (continuous float index)
         vc_pol_clipped = torch.clamp(vc_pol, min=min_bound, max=max_bound - 1e-3)
-        vc_grid = (vc_pol_clipped - min_bound) / intervals  # (M, 3)
+        if tpv_norm_shape is not None:
+            # Rescale directly to TPV sampling space so downstream
+            # `coord / (tpv_dim * scale) * 2 - 1` lands in [-1, 1).
+            target = torch.tensor(
+                list(tpv_norm_shape), dtype=torch.float32, device=device)
+            vc_grid = (vc_pol_clipped - min_bound) \
+                / (max_bound - min_bound) * target  # (M, 3)
+        else:
+            # Legacy: range [0, cyl_grid_size). Only correct when
+            # cyl_grid_size matches tpv_norm_shape exactly.
+            vc_grid = (vc_pol_clipped - min_bound) / intervals  # (M, 3)
 
         # Expand to batch
         voxels_coarse = vc_grid.unsqueeze(0).expand(B, -1, -1)  # (B, M, 3)
