@@ -80,51 +80,64 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
         self.debug_zero_lidar = debug_zero_lidar
         self.debug_camera_only_bypass = debug_camera_only_bypass
 
-        # ---- LiDAR feature extraction ----
-        self.lidar_tokenizer = builder.build_backbone(lidar_tokenizer)
-        self.lidar_backbone = builder.build_backbone(lidar_backbone)
-        self.lidar_neck = builder.build_neck(lidar_neck)
-        self.tpv_fuser = builder.build_fusion_layer(tpv_fuser)
-
-        # ---- Channel projection: reduce LiDAR C before Z-flatten ----
-        self.lidar_proj_in = lidar_proj_in
-        self.lidar_proj_out = lidar_proj_out
-        self.lidar_Dz = lidar_Dz
-        self.lidar_voxel_proj = nn.Sequential(
-            nn.Linear(lidar_proj_in, lidar_proj_out),
-            nn.ReLU(inplace=True),
-        )
-
-        # ---- Adapters ----
-        lidar_bev_channels = lidar_proj_out * lidar_Dz  # e.g. 64*10=640
-        if cam_adapter_cfg is not None:
-            self.cam_adapter = ConvModule(**cam_adapter_cfg)
-            cam_out = cam_adapter_cfg['out_channels']
-        else:
+        if debug_camera_only_bypass:
+            # Skip all fusion-path modules; extract_feat short-circuits
+            # cam_bev → occ_encoder. Lets the config omit LiDAR cfgs entirely
+            # and frees VRAM so samples_per_gpu can match step2.
+            self.lidar_tokenizer = None
+            self.lidar_backbone = None
+            self.lidar_neck = None
+            self.tpv_fuser = None
+            self.lidar_voxel_proj = None
             self.cam_adapter = None
-            cam_out = fused_channels
-
-        if lidar_adapter_cfg is not None:
-            self.lidar_adapter = ConvModule(**lidar_adapter_cfg)
-            lidar_out = lidar_adapter_cfg['out_channels']
+            self.lidar_adapter = None
+            self.fuse_conv = None
         else:
-            self.lidar_adapter = nn.Identity()
-            lidar_out = lidar_bev_channels
+            # ---- LiDAR feature extraction ----
+            self.lidar_tokenizer = builder.build_backbone(lidar_tokenizer)
+            self.lidar_backbone = builder.build_backbone(lidar_backbone)
+            self.lidar_neck = builder.build_neck(lidar_neck)
+            self.tpv_fuser = builder.build_fusion_layer(tpv_fuser)
 
-        # ---- Fusion conv: cat → project to backbone input channels ----
-        if fuse_conv_cfg is not None:
-            self.fuse_conv = ConvModule(**fuse_conv_cfg)
-        else:
-            self.fuse_conv = ConvModule(
-                cam_out + lidar_out,
-                fused_channels,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-                bias=False,
-                norm_cfg=dict(type='BN'),
-                act_cfg=dict(type='ReLU'),
+            # ---- Channel projection: reduce LiDAR C before Z-flatten ----
+            self.lidar_proj_in = lidar_proj_in
+            self.lidar_proj_out = lidar_proj_out
+            self.lidar_Dz = lidar_Dz
+            self.lidar_voxel_proj = nn.Sequential(
+                nn.Linear(lidar_proj_in, lidar_proj_out),
+                nn.ReLU(inplace=True),
             )
+
+            # ---- Adapters ----
+            lidar_bev_channels = lidar_proj_out * lidar_Dz  # e.g. 64*10=640
+            if cam_adapter_cfg is not None:
+                self.cam_adapter = ConvModule(**cam_adapter_cfg)
+                cam_out = cam_adapter_cfg['out_channels']
+            else:
+                self.cam_adapter = None
+                cam_out = fused_channels
+
+            if lidar_adapter_cfg is not None:
+                self.lidar_adapter = ConvModule(**lidar_adapter_cfg)
+                lidar_out = lidar_adapter_cfg['out_channels']
+            else:
+                self.lidar_adapter = nn.Identity()
+                lidar_out = lidar_bev_channels
+
+            # ---- Fusion conv: cat → project to backbone input channels ----
+            if fuse_conv_cfg is not None:
+                self.fuse_conv = ConvModule(**fuse_conv_cfg)
+            else:
+                self.fuse_conv = ConvModule(
+                    cam_out + lidar_out,
+                    fused_channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=False,
+                    norm_cfg=dict(type='BN'),
+                    act_cfg=dict(type='ReLU'),
+                )
 
         # ---- Cylindrical grid params (for voxels_coarse generation) ----
         self.cyl_grid_size = np.array(cyl_grid_size) if cyl_grid_size is not None \
