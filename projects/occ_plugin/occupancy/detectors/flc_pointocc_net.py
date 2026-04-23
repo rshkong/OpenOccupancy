@@ -37,10 +37,11 @@ from mmcv.cnn import ConvModule
 from mmdet3d.models import builder
 
 from .occnet import OccNet
+from .lidar_prep_mixin import LidarPrepMixin
 
 
 @DETECTORS.register_module()
-class FLCPointOccNet(OccNet):
+class FLCPointOccNet(LidarPrepMixin, OccNet):
     """Dual-branch fusion detector: FLC camera BEV + PointOcc LiDAR TPV."""
 
     def __init__(self,
@@ -65,12 +66,19 @@ class FLCPointOccNet(OccNet):
                  occ_coarse_ratio=1,
                  # Debug flags
                  debug_zero_lidar=False,
+                 debug_camera_only_bypass=False,
                  **kwargs):
         super().__init__(**kwargs)
 
-        # When True, zeros lidar_feat before fusion → degrades to pure camera (FlashOcc).
-        # Use to verify fusion path has no bug before debugging fusion quality.
+        # debug_zero_lidar: zeros lidar_feat AFTER cam_adapter/lidar_adapter, still
+        #   runs both adapters and fuse_conv. Tests "does the fusion path carry
+        #   usable camera signal when LiDAR is neutralized."
+        # debug_camera_only_bypass: skips cam_adapter / LiDAR branch / fuse_conv
+        #   entirely; feeds cam_bev straight to the 2D encoder. True FLC-step2 path.
+        #   Tests "is the camera branch itself intact, independent of the
+        #   adapters." When both flags are True, bypass takes precedence.
         self.debug_zero_lidar = debug_zero_lidar
+        self.debug_camera_only_bypass = debug_camera_only_bypass
 
         # ---- LiDAR feature extraction ----
         self.lidar_tokenizer = builder.build_backbone(lidar_tokenizer)
@@ -130,21 +138,6 @@ class FLCPointOccNet(OccNet):
         self.occ_coarse_ratio = occ_coarse_ratio
 
     # ------------------------------------------------------------------
-    # LiDAR feature extraction
-    # ------------------------------------------------------------------
-    def extract_lidar_tpv(self, points, grid_ind):
-        """CylinderEncoder → Swin → FPN → tpv_list (3 planes)."""
-        x_3view = self.lidar_tokenizer(points, grid_ind)
-        tpv_list = []
-        x_tpv = self.lidar_backbone(x_3view)  # list of 3 lists
-        for x in x_tpv:
-            x = self.lidar_neck(x)
-            if not isinstance(x, torch.Tensor):
-                x = x[0]
-            tpv_list.append(x)
-        return tpv_list
-
-    # ------------------------------------------------------------------
     # Override extract_feat for dual-branch
     # ------------------------------------------------------------------
     def extract_feat(self, points, img, img_metas):
@@ -180,6 +173,21 @@ class FLCPointOccNet(OccNet):
 
         # cam_bev: [B, C*Dz, X, Y]
         cam_bev = img_voxel_feats
+
+        # === Full camera-only bypass: exact FLC-step2 path ===
+        # Skip cam_adapter / LiDAR branch / fuse_conv entirely. The 2D encoder
+        # receives cam_bev with the original 640 channels, identical to what
+        # OccNet gives it in the pure-camera config. Used to isolate whether
+        # the camera branch itself is intact, without any fusion-path layers.
+        # NOTE: unused modules (cam_adapter, fuse_conv, lidar_*) still exist
+        # as parameters. For single-GPU `tools/train.py` this is fine. For DDP
+        # set `find_unused_parameters=True` and `static_graph=False` in config.
+        if self.debug_camera_only_bypass:
+            voxel_feats_enc = self.occ_encoder(cam_bev)
+            if type(voxel_feats_enc) is not list:
+                voxel_feats_enc = [voxel_feats_enc]
+            return (voxel_feats_enc, img_feats, None, depth)
+
         if self.cam_adapter is not None:
             cam_feat = self.cam_adapter(cam_bev)
         else:
@@ -201,7 +209,7 @@ class FLCPointOccNet(OccNet):
             ]
             grid_ind, voxels_coarse = self._prepare_lidar_inputs(
                 points, tpv_norm_shape=tpv_norm_shape)
-            tpv_list = self.extract_lidar_tpv(points, grid_ind)
+            tpv_list = self.extract_lidar_tpv(grid_ind)
             lidar_3d = self.tpv_fuser(tpv_list, voxels_coarse)
             # lidar_3d: [B, C_tpv, X, Y, Z]
 
@@ -250,144 +258,6 @@ class FLCPointOccNet(OccNet):
             self.time_stats['occ_encoder'].append(t6 - t5)
 
         return (voxel_feats_enc, img_feats, pts_feats, depth)
-
-    # ------------------------------------------------------------------
-    # Point cloud preprocessing (cylindrical grid)
-    # ------------------------------------------------------------------
-    def _cart2polar(self, xyz):
-        """Cartesian [x,y,z] → cylindrical [rho, phi, z]."""
-        rho = torch.sqrt(xyz[:, :, 0] ** 2 + xyz[:, :, 1] ** 2)
-        phi = torch.atan2(xyz[:, :, 1], xyz[:, :, 0])
-        return torch.stack([rho, phi, xyz[:, :, 2]], dim=-1)
-
-    def _prepare_lidar_inputs(self, points, tpv_norm_shape=None):
-        """Generate cylindrical grid_ind and voxels_coarse from raw points.
-
-        Args:
-            points: list of (N_i, 5) tensors [x, y, z, intensity, ring]
-                    or (B, N, 5) padded tensor
-            tpv_norm_shape: optional (3,) iterable giving the effective TPV
-                sampling resolution [W_tpv*scale_w, H_tpv*scale_h, Z_tpv*scale_z].
-                When provided, voxels_coarse is scaled to [0, tpv_norm_shape)
-                so that TPVFuser/TPVAggregator's `coord / dim * 2 - 1`
-                round-trips to [-1, 1].  When None, falls back to grid-index
-                space [0, cyl_grid_size) — matches the legacy convention and
-                only works when cyl_grid_size == tpv_norm_shape.
-
-        Returns:
-            grid_ind: list of B tensors, each (N_i, 3) int32
-            voxels_coarse: (B, M, 3) float — cylindrical grid coords of
-                           coarse Cartesian voxel centres
-        """
-        device = points[0].device if isinstance(points, list) else points.device
-        min_bound = torch.tensor(self.cyl_min_bound, dtype=torch.float32, device=device)
-        max_bound = torch.tensor(self.cyl_max_bound, dtype=torch.float32, device=device)
-        cyl_grid = torch.tensor(self.cyl_grid_size, dtype=torch.float32, device=device)
-        intervals = (max_bound - min_bound) / cyl_grid
-
-        # ---- grid_ind: per-point cylindrical voxel index ----
-        grid_ind_list = []
-        point_feats_list = []
-
-        if isinstance(points, list):
-            batch_points = points
-        else:
-            # Padded tensor: split by batch
-            batch_points = [points[b] for b in range(points.shape[0])]
-
-        for pts in batch_points:
-            if pts.ndim == 1:
-                pts = pts.unsqueeze(0)
-            xyz = pts[:, :3]  # (N, 3)
-            feat = pts[:, 3:]  # (N, >=1) intensity [+ ring]
-            # Pad to 2 columns if ring index is missing
-            if feat.shape[1] < 2:
-                feat = torch.cat([feat, torch.zeros(feat.shape[0], 2 - feat.shape[1], device=feat.device)], dim=1)
-
-            # Convert to cylindrical
-            rho = torch.sqrt(xyz[:, 0] ** 2 + xyz[:, 1] ** 2)
-            phi = torch.atan2(xyz[:, 1], xyz[:, 0])
-            xyz_pol = torch.stack([rho, phi, xyz[:, 2]], dim=-1)  # (N, 3)
-
-            # Clip and quantize
-            xyz_pol_clipped = torch.clamp(
-                xyz_pol,
-                min=min_bound,
-                max=max_bound - 1e-3)
-            gi = torch.floor(
-                (xyz_pol_clipped - min_bound) / intervals).to(torch.int32)  # (N, 3)
-            grid_ind_list.append(gi)
-
-            # Build 10-channel point features
-            voxel_centers = (gi.float() + 0.5) * intervals + min_bound
-            return_xyz = xyz_pol - voxel_centers  # centred polar coords
-            point_feat = torch.cat([
-                return_xyz,     # 3: centred rho, phi, z
-                xyz_pol,        # 3: absolute rho, phi, z
-                xyz[:, :2],     # 2: absolute x, y
-                feat,           # 2: intensity, ring
-            ], dim=-1)  # (N, 10)
-            point_feats_list.append(point_feat)
-
-        # Stack point features into (B, N_max, 10) padded tensor
-        B = len(point_feats_list)
-        max_n = max(pf.shape[0] for pf in point_feats_list)
-        points_padded = torch.zeros(B, max_n, 10, device=device)
-        for i, pf in enumerate(point_feats_list):
-            points_padded[i, :pf.shape[0]] = pf
-
-        # ---- voxels_coarse: Cartesian voxel centres → cylindrical coords ----
-        occ_grid = self.occ_grid_size // self.occ_coarse_ratio
-        pc_range = np.array([-51.2, -51.2, -5.0, 51.2, 51.2, 3.0])
-        voxel_size = (pc_range[3:] - pc_range[:3]) / occ_grid
-
-        # Generate coarse voxel centres in Cartesian
-        idx = np.indices(occ_grid)  # (3, W, H, D)
-        voxel_centres = (idx + 0.5) * voxel_size.reshape(3, 1, 1, 1) \
-            + pc_range[:3].reshape(3, 1, 1, 1)
-        voxel_centres = voxel_centres.reshape(3, -1).T  # (M, 3) in [x, y, z]
-
-        # Convert to cylindrical and normalise to grid coords
-        vc = torch.tensor(voxel_centres, dtype=torch.float32, device=device)
-        rho = torch.sqrt(vc[:, 0] ** 2 + vc[:, 1] ** 2)
-        phi = torch.atan2(vc[:, 1], vc[:, 0])
-        vc_pol = torch.stack([rho, phi, vc[:, 2]], dim=-1)
-
-        # Normalise to cylindrical grid coordinates (continuous float index)
-        vc_pol_clipped = torch.clamp(vc_pol, min=min_bound, max=max_bound - 1e-3)
-        if tpv_norm_shape is not None:
-            # Rescale directly to TPV sampling space so downstream
-            # `coord / (tpv_dim * scale) * 2 - 1` lands in [-1, 1).
-            target = torch.tensor(
-                list(tpv_norm_shape), dtype=torch.float32, device=device)
-            vc_grid = (vc_pol_clipped - min_bound) \
-                / (max_bound - min_bound) * target  # (M, 3)
-        else:
-            # Legacy: range [0, cyl_grid_size). Only correct when
-            # cyl_grid_size matches tpv_norm_shape exactly.
-            vc_grid = (vc_pol_clipped - min_bound) / intervals  # (M, 3)
-
-        # Expand to batch
-        voxels_coarse = vc_grid.unsqueeze(0).expand(B, -1, -1)  # (B, M, 3)
-
-        # Replace points tensor for CylinderEncoder
-        # Override the points input with our 10-channel features
-        self._lidar_points_10ch = points_padded
-
-        return grid_ind_list, voxels_coarse
-
-    def extract_lidar_tpv(self, points, grid_ind):
-        """Override to use pre-computed 10ch features."""
-        points_10ch = self._lidar_points_10ch
-        x_3view = self.lidar_tokenizer(points_10ch, grid_ind)
-        tpv_list = []
-        x_tpv = self.lidar_backbone(x_3view)
-        for x in x_tpv:
-            x = self.lidar_neck(x)
-            if not isinstance(x, torch.Tensor):
-                x = x[0]
-            tpv_list.append(x)
-        return tpv_list
 
     # ------------------------------------------------------------------
     # forward_train / forward_test: reuse OccNet's, which calls extract_feat

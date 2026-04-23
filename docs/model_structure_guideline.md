@@ -1109,3 +1109,545 @@ W_, H_, D_ = voxel_label.shape = [512, 512, 40]
 ```
 
 这个最终 occupancy 网格上比较指标。
+
+---
+
+## 8. PointOcc 原版源码阅读指南
+
+这一节只针对 `~/MyProject/PointOcc` 原版 PointOcc occupancy 网络，按“配置 -> dataloader -> model forward -> CylinderEncoder -> Swin/FPN -> TPVAggregator -> loss/eval”的真实代码顺序阅读。
+
+核心文件：
+
+- [/home/shkong/MyProject/PointOcc/config/pointtpv_nusc_occ.py](/home/shkong/MyProject/PointOcc/config/pointtpv_nusc_occ.py:31)
+- [/home/shkong/MyProject/PointOcc/dataloader/dataset.py](/home/shkong/MyProject/PointOcc/dataloader/dataset.py:40)
+- [/home/shkong/MyProject/PointOcc/dataloader/dataset_wrapper.py](/home/shkong/MyProject/PointOcc/dataloader/dataset_wrapper.py:188)
+- [/home/shkong/MyProject/PointOcc/model/pointtpv_occ.py](/home/shkong/MyProject/PointOcc/model/pointtpv_occ.py:7)
+- [/home/shkong/MyProject/PointOcc/model/cylinder_encoder.py](/home/shkong/MyProject/PointOcc/model/cylinder_encoder.py:106)
+- [/home/shkong/MyProject/PointOcc/model/swin.py](/home/shkong/MyProject/PointOcc/model/swin.py:746)
+- [/home/shkong/MyProject/PointOcc/model/fpn.py](/home/shkong/MyProject/PointOcc/model/fpn.py:80)
+- [/home/shkong/MyProject/PointOcc/model/tpv_aggregator.py](/home/shkong/MyProject/PointOcc/model/tpv_aggregator.py:157)
+
+### 8.1 原版 PointOcc 的完整流程图
+
+```text
+nuScenes LiDAR .bin + occupancy .npy
+
+-> Occ_Point_NuScenes.__getitem__()
+   points: [N_pts, 5]
+   pcd:    [N_occ, 4]  # [z, y, x, cls]
+
+-> Occ_DatasetWrapper_Point_NuScenes.__getitem__()
+   cartesian xyz -> cylindrical xyz_pol = [rho, phi, z]
+   grid_ind = floor((clip(xyz_pol) - min_bound) / intervals)
+   return_feat = concat(
+       xyz_pol - voxel_center,
+       xyz_pol,
+       xyz[:2],
+       points[:, 3:]
+   )
+
+   return:
+   voxel_position_grid_coarse: [N_coarse, 3]
+   processed_label:            [512, 512, 40]
+   grid_ind:                   [N_pts, 3]
+   return_feat:                [N_pts, 10]
+
+-> occ_custom_collate_fn
+   voxel_position_coarse: [B, N_coarse, 3]
+   points:                [B, N_pts, 10]
+   voxel_label:           [B, 512, 512, 40]
+   grid_ind:              [B, N_pts, 3]
+
+-> PointTPV_Occ.forward()
+   extract_lidar_feat(points, grid_ind)
+
+-> CylinderEncoder_Occ
+   point_mlp:    [N_pts, 10] -> [N_pts, 128]
+   scatter_max:  per cylindrical voxel -> sparse voxel features
+   SparseConvTensor over [480, 360, 32]
+   SparseMaxPool3d along z / rho / phi
+
+   output 3 TPV planes:
+   tpv_xy: [B, 128, 480, 360]
+   tpv_yz: [B, 128, 360, 32]
+   tpv_zx: [B, 128, 32, 480]
+
+-> Swin backbone
+   each TPV plane independently goes through patch embedding + Swin stages
+   output per plane: multi-scale features
+
+-> GeneralizedLSSFPN
+   top-down upsample + concat + ConvModule
+   output per plane: processed TPV feature, C=192
+
+-> TPVAggregator_Occ
+   interpolate TPV planes to sampling resolution
+   normalize coarse voxel queries to [-1, 1]
+   grid_sample from 3 planes:
+     [w, h] from tpv_hw
+     [h, z] from tpv_zh
+     [z, w] from tpv_wz
+   fused = tpv_hw_vox + tpv_zh_vox + tpv_wz_vox
+
+-> decoder + classifier
+   fused:  [B, N_coarse, 192]
+   logits: [B, N_coarse, 17]
+   reshape:
+   [B, 17, 256, 256, 20]
+
+-> training:
+   compute CE + Lovasz + semantic scaling + geometric scaling loss
+
+-> eval:
+   trilinear interpolate to [B, 17, 512, 512, 40]
+```
+
+### 8.2 配置里的关键尺寸
+
+原版配置在 [/home/shkong/MyProject/PointOcc/config/pointtpv_nusc_occ.py](/home/shkong/MyProject/PointOcc/config/pointtpv_nusc_occ.py:31)：
+
+```python
+_dim_ = 192
+
+tpv_w_ = 240
+tpv_h_ = 180
+tpv_z_ = 16
+scale_w = 2
+scale_h = 2
+scale_z = 2
+
+grid_size = [480, 360, 32]
+grid_size_occ = [512, 512, 40]
+coarse_ratio = 2
+nbr_class = 17
+```
+
+含义：
+
+```text
+grid_size = [480, 360, 32]
+```
+
+这是 LiDAR 点云在柱坐标系下的离散网格，三个维度对应：
+
+```text
+[rho, phi, z]
+```
+
+```text
+grid_size_occ = [512, 512, 40]
+```
+
+这是最终 occupancy 标签网格。
+
+```text
+coarse_ratio = 2
+```
+
+表示 PointOcc 不直接预测 `[512,512,40]`，而是先预测：
+
+```text
+[512/2, 512/2, 40/2] = [256, 256, 20]
+```
+
+```text
+tpv_w/h/z * scale_w/h/z = [480, 360, 32]
+```
+
+这是 `TPVAggregator_Occ` 采样时使用的逻辑 TPV 坐标范围，和 `grid_size` 对齐。
+
+### 8.3 dataloader 如何把点云变成 PointOcc 输入
+
+原始点云读取在 [/home/shkong/MyProject/PointOcc/dataloader/dataset.py](/home/shkong/MyProject/PointOcc/dataloader/dataset.py:59)：
+
+```python
+points = np.fromfile(lidar_path, dtype=np.float32).reshape([-1, 5])
+```
+
+如果使用 multi-sweep，历史 sweep 会被变换到当前 LiDAR 坐标系，并且代码会写入时间差：
+
+```python
+points_sweep[:, :3] = points_sweep[:, :3] @ R.T + t
+points_sweep[:, 4] = ts - sweep_ts
+```
+
+所以 PointOcc 的 `points[:, 3:]` 更准确地说是 LiDAR 的附加特征，不应该简单理解成固定的 `[intensity, ring]`。多 sweep 下最后一维经常承担 time lag。
+
+包装器在 [/home/shkong/MyProject/PointOcc/dataloader/dataset_wrapper.py](/home/shkong/MyProject/PointOcc/dataloader/dataset_wrapper.py:215) 做三件事。
+
+第一，笛卡尔坐标转柱坐标：
+
+```text
+rho = sqrt(x^2 + y^2)
+phi = atan2(y, x)
+z   = z
+xyz_pol = [rho, phi, z]
+```
+
+第二，计算每个点的柱坐标网格索引：
+
+```python
+intervals = (max_bound - min_bound) / grid_size
+grid_ind = floor((clip(xyz_pol) - min_bound) / intervals)
+```
+
+也就是：
+
+```text
+grid_ind[i] = floor((xyz_pol[i] - min_bound) / voxel_size_cyl)
+```
+
+第三，构建 10 维点特征：
+
+```python
+voxel_centers = (grid_ind + 0.5) * intervals + min_bound
+return_xyz = xyz_pol - voxel_centers
+return_feat = concat(return_xyz, xyz_pol, xyz[:, :2], feat)
+```
+
+形状：
+
+```text
+return_xyz: [N_pts, 3]  # 点相对所在柱坐标 voxel 中心的偏移
+xyz_pol:    [N_pts, 3]  # 点的绝对柱坐标
+xyz[:, :2]: [N_pts, 2]  # 原始 x,y
+feat:       [N_pts, 2]  # 原始点云附加特征
+
+return_feat: [N_pts, 10]
+```
+
+同时，dataloader 还会生成所有 coarse occupancy query 的柱坐标连续索引：
+
+```python
+voxel_position_coarse = centers of [256, 256, 20] Cartesian coarse grid
+voxel_position_grid_coarse = (cart2polar(voxel_position_coarse) - min_bound) / intervals_vox
+```
+
+这里的 `voxel_position_grid_coarse` 不是点云，也不是特征，而是后面用于 `grid_sample` 的 query 坐标表。
+
+### 8.4 PointTPV_Occ.forward 的主调用链
+
+入口在 [/home/shkong/MyProject/PointOcc/model/pointtpv_occ.py](/home/shkong/MyProject/PointOcc/model/pointtpv_occ.py:43)：
+
+```python
+x_lidar_tpv = self.extract_lidar_feat(points=points, grid_ind=grid_ind)
+outs = self.tpv_aggregator(
+    x_lidar_tpv,
+    voxels=grid_ind_vox,
+    voxels_coarse=grid_ind_vox_coarse,
+    voxel_label=voxel_label,
+    return_loss=return_loss)
+```
+
+`extract_lidar_feat()` 的顺序是：
+
+```python
+x_3view = self.lidar_tokenizer(points, grid_ind)
+x_tpv = self.lidar_backbone(x_3view)
+for x in x_tpv:
+    x = self.lidar_neck(x)
+    tpv_list.append(x[0])
+```
+
+对应流程：
+
+```text
+CylinderEncoder_Occ -> Swin -> GeneralizedLSSFPN -> TPVAggregator_Occ
+```
+
+### 8.5 CylinderEncoder_Occ 的核心实现
+
+代码在 [/home/shkong/MyProject/PointOcc/model/cylinder_encoder.py](/home/shkong/MyProject/PointOcc/model/cylinder_encoder.py:158)。
+
+第一步，把 batch id 拼到每个点的网格索引前面：
+
+```python
+cat_pt_ind.append(F.pad(grid_ind[i_batch], (1, 0), value=i_batch))
+```
+
+原来：
+
+```text
+grid_ind: [N_pts, 3] = [rho_idx, phi_idx, z_idx]
+```
+
+变成：
+
+```text
+cat_pt_ind: [N_pts, 4] = [batch_idx, rho_idx, phi_idx, z_idx]
+```
+
+第二步，point-wise MLP：
+
+```python
+processed_cat_pt_fea = self.point_mlp(cat_pt_fea)
+```
+
+形状：
+
+```text
+[N_pts, 10] -> [N_pts, 128]
+```
+
+第三步，同一个柱坐标 voxel 内的点做 max 聚合：
+
+```python
+unq, unq_inv, unq_cnt = torch.unique(cat_pt_ind, return_inverse=True, return_counts=True, dim=0)
+pooled_data = torch_scatter.scatter_max(processed_cat_pt_fea, unq_inv, dim=0)[0]
+```
+
+公式可以理解成：
+
+```text
+voxel_feat[v] = max_{i | grid_ind_i = v} point_mlp(point_feat_i)
+```
+
+第四步，构造稀疏柱坐标体：
+
+```python
+ret = SparseConvTensor(processed_pooled_data, coors, np.array(self.grid_size), batch_size)
+```
+
+此时逻辑空间是：
+
+```text
+[rho, phi, z] = [480, 360, 32]
+```
+
+第五步，用三种 `SparseMaxPool3d` 得到三张 TPV plane：
+
+```python
+tpv_xy = pool along z
+tpv_yz = pool along rho
+tpv_zx = pool along phi
+```
+
+原版配置 `split=[8,8,8]`，因此：
+
+```text
+pool_xy: kernel [1, 1, 4]   # 32 / 8 = 4，压缩 z
+pool_yz: kernel [60, 1, 1]  # 480 / 8 = 60，压缩 rho
+pool_zx: kernel [1, 45, 1]  # 360 / 8 = 45，压缩 phi
+```
+
+压缩后的 `split` 维度会被 flatten 到 channel，再用一个小 MLP 压回 `128` 通道。
+
+输出形状：
+
+```text
+tpv_xy: [B, 128, 480, 360]
+tpv_yz: [B, 128, 360, 32]
+tpv_zx: [B, 128, 32, 480]
+```
+
+这一步是 PointOcc 的关键：它没有把所有空间都留在一个 dense 3D tensor 中，而是用三张 2D plane 分别保留三组投影视角。
+
+### 8.6 Swin + GeneralizedLSSFPN 如何处理三张 TPV plane
+
+Swin 在 [/home/shkong/MyProject/PointOcc/model/swin.py](/home/shkong/MyProject/PointOcc/model/swin.py:746) 里对三张 plane 使用同一套逻辑：
+
+```python
+for x in x_3view:
+    x, hw_shape = self.patch_embed_lidar(x)
+...
+for stage in self.stages:
+    for j in range(len(x_tpv)):
+        x_tpv[j], hw_shape_tpv[j], out, out_hw_shape = stage(...)
+        if i in self.out_indices:
+            outs[j].append(out)
+```
+
+注意这里不是把三张 plane concat 后一起过 Swin，而是：
+
+```text
+tpv_xy -> Swin -> multi-scale xy features
+tpv_yz -> Swin -> multi-scale yz features
+tpv_zx -> Swin -> multi-scale zx features
+```
+
+`GeneralizedLSSFPN` 在 [/home/shkong/MyProject/PointOcc/model/fpn.py](/home/shkong/MyProject/PointOcc/model/fpn.py:80) 做 top-down 融合：
+
+```python
+x = F.interpolate(laterals[i + 1], size=laterals[i].shape[2:])
+laterals[i] = torch.cat([laterals[i], x], dim=1)
+laterals[i] = self.lateral_convs[i](laterals[i])
+laterals[i] = self.fpn_convs[i](laterals[i])
+```
+
+输出被 `PointTPV_Occ.extract_lidar_feat()` 取第一个尺度：
+
+```python
+if not isinstance(x, torch.Tensor):
+    x = x[0]
+```
+
+因此传给 `TPVAggregator_Occ` 的是三张已经过 Swin/FPN 处理的 TPV feature plane，通道数通常是：
+
+```text
+C = _dim_ = 192
+```
+
+### 8.7 TPVAggregator_Occ 的公式化理解
+
+代码在 [/home/shkong/MyProject/PointOcc/model/tpv_aggregator.py](/home/shkong/MyProject/PointOcc/model/tpv_aggregator.py:188)。
+
+输入：
+
+```text
+tpv_xy:        [B, C, W_tpv, H_tpv]
+tpv_yz:        [B, C, H_tpv, Z_tpv]
+tpv_zx:        [B, C, Z_tpv, W_tpv]
+voxels_coarse: [B, N, 3]
+```
+
+先重排为 PyTorch `grid_sample` 更习惯的二维图格式：
+
+```python
+tpv_hw = tpv_xy.permute(0, 1, 3, 2)
+tpv_wz = tpv_zx.permute(0, 1, 3, 2)
+tpv_zh = tpv_yz.permute(0, 1, 3, 2)
+```
+
+然后插值到逻辑 TPV 采样分辨率：
+
+```text
+tpv_hw -> [B, C, 360, 480]
+tpv_zh -> [B, C,  32, 360]
+tpv_wz -> [B, C, 480,  32]
+```
+
+把 query 坐标归一化：
+
+```text
+w_norm = w / (tpv_w * scale_w) * 2 - 1
+h_norm = h / (tpv_h * scale_h) * 2 - 1
+z_norm = z / (tpv_z * scale_z) * 2 - 1
+```
+
+然后分别采样：
+
+```python
+F_hw(q) = grid_sample(tpv_hw, [w_norm, h_norm])
+F_zh(q) = grid_sample(tpv_zh, [h_norm, z_norm])
+F_wz(q) = grid_sample(tpv_wz, [z_norm, w_norm])
+```
+
+融合公式：
+
+```text
+F(q) = F_hw(q) + F_zh(q) + F_wz(q)
+```
+
+其中 `q` 是一个 coarse voxel query。
+
+形状变化：
+
+```text
+F_hw(q), F_zh(q), F_wz(q): [B, C, N]
+fused:                    [B, C, N]
+permute:                  [B, N, C]
+```
+
+最后逐 query 分类：
+
+```python
+fused = decoder(fused)
+logits = classifier(fused)
+```
+
+形状：
+
+```text
+[B, N, 192]
+-> [B, N, 192]
+-> [B, N, 17]
+-> [B, 17, 256, 256, 20]
+```
+
+### 8.8 训练 loss 和评估输出
+
+训练入口在 [/home/shkong/MyProject/PointOcc/train_occ.py](/home/shkong/MyProject/PointOcc/train_occ.py:187)：
+
+```python
+loss = my_model(
+    points=points,
+    grid_ind=train_grid,
+    grid_ind_vox_coarse=train_grid_vox_coarse,
+    voxel_label=voxel_label,
+    return_loss=True)
+```
+
+`TPVAggregator_Occ` 里如果 `return_loss=True`，会计算：
+
+```text
+loss = CE
+     + Lovasz
+     + semantic scaling loss
+     + geometric scaling loss
+```
+
+如果 coarse logits 是 `[256,256,20]`，而 GT 是 `[512,512,40]`，代码会先把 GT 按 `ratio=2` 聚合到 coarse 分辨率：
+
+```python
+voxel_label_coarse = voxel_label.reshape(
+    B, W, ratio, H, ratio, D, ratio
+).permute(...).reshape(B, W, H, D, ratio**3)
+```
+
+这里的逻辑是：一个 coarse voxel 覆盖 `ratio^3` 个 final voxel，然后用众数作为 coarse label；空类 `0` 会被特殊处理，避免大面积 empty 直接压过非空类别。
+
+评估入口在 [/home/shkong/MyProject/PointOcc/eval_occ.py](/home/shkong/MyProject/PointOcc/eval_occ.py:121)：
+
+```python
+predict_labels_vox = my_model(..., return_loss=False)
+predict_labels_vox = torch.argmax(predict_labels_vox, dim=1)
+```
+
+`return_loss=False` 时，`TPVAggregator_Occ` 会把 coarse logits 插值回 GT 尺寸：
+
+```python
+pred = F.interpolate(
+    logits,
+    size=[512, 512, 40],
+    mode='trilinear',
+    align_corners=False)
+```
+
+所以原版 PointOcc 的实际训练监督发生在 coarse 分辨率 `[256,256,20]`，但最终评估在 `[512,512,40]`。
+
+### 8.9 对 FLC-PointOcc 融合的直接启发
+
+原版 PointOcc 最适合迁移的不是最终 `classifier` 输出，而是 `TPVAggregator_Occ` 中这一步之前或这一步得到的 query feature：
+
+```text
+fused: [B, N, 192]
+```
+
+如果你要和 FLC 的 BEV 对齐，有两条路线：
+
+```text
+路线 A：先 query，再 reshape
+fused [B, N, C]
+-> reshape [B, X, Y, Z, C]
+-> permute [B, C, X, Y, Z]
+-> flatten Z
+-> [B, C*Z, X, Y]
+-> 与 FLC BEV feature 融合
+```
+
+```text
+路线 B：保留 TPV plane，不急着 query
+tpv_xy / tpv_yz / tpv_zx
+-> 为 FLC 的 [X,Y,Z] 网格生成 query
+-> grid_sample 得到 [B, C, X, Y, Z]
+-> flatten Z
+-> 与 FLC BEV feature 融合
+```
+
+当前 FLC-PointOcc 更接近路线 B 的变体：先用 TPV fuser 得到 `[B,C,X,Y,Z]`，再把 `Z` 压进 channel 和 FLC BEV 做融合。检查这类融合时，最重要的是确认三件事：
+
+```text
+1. PointOcc 的 query 坐标是否和 FLC 的 [128,128,10] 网格严格对齐
+2. TPV 采样坐标归一化分母是否等于真实 TPV 逻辑尺寸
+3. flatten Z 后的 channel 顺序是否和 FLCOccHead 的 C2H 预期一致
+```

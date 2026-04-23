@@ -112,7 +112,8 @@ model = dict(
     # Step 1 degrade switch: zero LiDAR after fusion → should match FlashOcc.
     # If metrics match FlashOcc baseline → fusion path is bug-free.
     # If metrics still worse → fusion path has channel/norm/grad bug.
-    debug_zero_lidar=True,
+    debug_zero_lidar=False,
+    debug_camera_only_bypass=True,
     # ---- Camera branch (same as FLC) ----
     img_backbone=dict(
         pretrained='torchvision://resnet50',
