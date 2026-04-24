@@ -100,10 +100,26 @@ PYTHONPATH="./":$PYTHONPATH python tools/train.py \
 
 ---
 
-## 4. LiDAR-only: PointOcc 复现（最新）
+## 4. LiDAR-only: PointOcc 复现（服务器版，对齐原版 recipe）
 
 - Config: `projects/configs/baselines/LiDAR_pointocc_128x128x10_4070ti.py`
-- 单卡 `tools/train.py`
+- 目标 effective batch = 8（对齐原版 8 GPU × bs=1），推荐 **2 GPU × samples_per_gpu=4**
+
+**前置：下载 Swin-T 预训练权重**（config 里引用了这个路径）
+
+```bash
+mkdir -p pretrain
+wget -O pretrain/swin_tiny_patch4_window7_224.pth \
+    https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth
+```
+
+**多卡 DDP 训练**（run.sh 的第二个参数是 GPU 数）
+
+```bash
+bash run.sh projects/configs/baselines/LiDAR_pointocc_128x128x10_4070ti.py 2
+```
+
+**或单卡 debug/smoke test**（注意 bs=4 在 12GB 卡上可能 OOM，可手动改到 1-2）
 
 ```bash
 PYTHONPATH="./":$PYTHONPATH python tools/train.py \
@@ -111,6 +127,8 @@ PYTHONPATH="./":$PYTHONPATH python tools/train.py \
     --work-dir work_dirs/LiDAR_pointocc_128x128x10_4070ti \
     --seed 0
 ```
+
+如果服务器 GPU 数不是 2，按"effective batch = samples_per_gpu × GPU 数 = 8"调整 `samples_per_gpu`，lr 保持 2e-4 不动。偏离 8 时按 linear scaling 微调。
 
 用途：验证 LiDAR 分支（CylinderEncoder + TPVSwin + TPVFPN + TPVAggregator）
 单独是否能复现 PointOcc 的精度；如果能，融合模型跑不过 FlashOcc 的锅就落在融合
