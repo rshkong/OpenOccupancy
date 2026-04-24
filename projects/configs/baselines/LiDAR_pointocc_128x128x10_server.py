@@ -3,18 +3,30 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 # ============================================================
-# LiDAR-only PointOcc reproduction on RTX 4070 Ti (12 GB).
+# LiDAR-only PointOcc reproduction — server run (aligned with原版 recipe).
 #
 # Pipeline:
 #   points → CylinderEncoder → TPVSwin → TPVFPN → TPVAggregator
 #           → logits [B, 17, 128, 128, 10]
 #           → CE + Lovasz + sem_scal + geo_scal (weights [1,1,1,1])
 #
-# Differences from PointOcc's `pointtpv_nusc_occ.py`:
-#   - cyl_grid_size halved from [480, 360, 32] → [240, 180, 16] for VRAM.
-#   - Correspondingly tpv_(h,w,z) = [45, 60, 4] (vs. PointOcc's [90, 120, 8]).
-#   - scale_(h,w,z) = 2 keeps aggregator sampling resolution at cyl_grid_size,
-#     which matches the voxels_coarse range produced by _prepare_lidar_inputs.
+# Aligned with PointOcc `pointtpv_nusc_occ.py`:
+#   - cyl_grid_size = [480, 360, 32]                          (原版)
+#   - tpv_(w,h,z)   = cyl_grid / 2 = [240, 180, 16]           (原版)
+#   - scale_(h,w,z) = 2 → aggregator samples at cyl_grid      (原版)
+#   - CylinderEncoder split = [8, 8, 8]                       (原版)
+#   - Swin pretrained = swin_tiny_patch4_window7_224.pth      (原版)
+#   - lr = 2e-4 with target effective batch = 8 (2 GPUs × bs=4)
+#   - max_epochs = 24, AdamW + cosine + warmup                (原版)
+#
+# Kept different from PointOcc (known deltas):
+#   - occ_grid_size = [128, 128, 10] (aligned with FLC) instead of [512,512,40]
+#   - BDA augmentation ON (kept for future FLC fusion consistency; 原版 off)
+#   - with_cp=True (activation checkpointing — saves VRAM, numerically identical)
+#   - TPVFPN (our port of GeneralizedLSSFPN — numerically verified equivalent)
+#   - LidarPrepMixin in detector (vs. PointOcc's dataset-wrapper) — refactor only
+#   - 原版 config 里的 `img_backbone lr_mult=0.1` 是 no-op（模型里没 img_backbone），
+#     我们也同样没加。
 # ============================================================
 
 input_modality = dict(
@@ -43,11 +55,11 @@ dataset_type = 'NuscOCCDataset'
 data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
-# ---- TPV branch dims ----
-cyl_grid_size = [240, 180, 16]
-tpv_w = cyl_grid_size[0] // 4   # 60  (Swin patch_embed stride 4)
-tpv_h = cyl_grid_size[1] // 4   # 45
-tpv_z = cyl_grid_size[2] // 4   # 4
+# ---- TPV branch dims (aligned with原版) ----
+cyl_grid_size = [480, 360, 32]
+tpv_w = cyl_grid_size[0] // 2   # 240  (matches 原版 tpv_w_)
+tpv_h = cyl_grid_size[1] // 2   # 180
+tpv_z = cyl_grid_size[2] // 2   # 16
 tpv_C = 192                     # TPVFPN output channels per plane
 
 # ---- Occupancy grid ----
@@ -56,7 +68,6 @@ occ_coarse_ratio = 1
 
 model = dict(
     type='PointOccNet',
-    # LiDAR TPV branch (reused from fusion config)
     lidar_tokenizer=dict(
         type='CylinderEncoder',
         grid_size=cyl_grid_size,
@@ -64,7 +75,7 @@ model = dict(
         out_channels=128,
         fea_compre=None,
         base_channels=128,
-        split=[4, 4, 4],
+        split=[8, 8, 8],                    # 原版
         track_running_stats=False,
     ),
     lidar_backbone=dict(
@@ -87,7 +98,7 @@ model = dict(
         out_indices=[1, 2, 3],
         with_cp=True,
         convert_weights=True,
-        # pretrained='pretrain/swin_tiny_patch4_window7_224.pth',
+        pretrained='pretrain/swin_tiny_patch4_window7_224.pth',
     ),
     lidar_neck=dict(
         type='TPVFPN',
@@ -115,14 +126,12 @@ model = dict(
         scale_z=2,
         use_checkpoint=True,
     ),
-    # Cylindrical grid config for _prepare_lidar_inputs
     cyl_grid_size=cyl_grid_size,
     cyl_min_bound=[0.0, -3.14159265, -5.0],
     cyl_max_bound=[50.0, 3.14159265, 3.0],
     occ_grid_size=occ_grid_size,
     occ_coarse_ratio=occ_coarse_ratio,
     pc_range=point_cloud_range,
-    # PointOcc loss: CE + Lovasz + sem_scal + geo_scal, equal weights
     loss_weight=(1.0, 1.0, 1.0, 1.0),
     ignore_index=255,
     empty_idx=empty_idx,
@@ -199,8 +208,10 @@ train_config = dict(
     pc_range=point_cloud_range,
     box_type_3d='LiDAR')
 
+# Target: 2 GPU × samples_per_gpu=4 → effective batch = 8 (matches 原版 8×1).
+# If server has different GPU count, rescale: samples_per_gpu × gpus = 8 → same lr.
 data = dict(
-    samples_per_gpu=1,
+    samples_per_gpu=4,
     workers_per_gpu=2,
     train=train_config,
     val=test_config,
@@ -211,7 +222,7 @@ data = dict(
 
 optimizer = dict(
     type='AdamW',
-    lr=3e-4,
+    lr=2e-4,
     weight_decay=0.01)
 
 optimizer_config = dict(
