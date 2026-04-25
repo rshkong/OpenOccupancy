@@ -57,3 +57,12 @@ occ_encoder                 0.18 GB            0.55 GB        0.64 GB
 occ_head                    0.01 GB            0.33 GB        0.65 GB
 
 Loaded checkpoint epoch: 10
+
+
+
+
+
+2026.4.26实验记录
+LiDAR_pointocc > LiDAR_baseline >> cam_baseline > flashocc(sample5) > flashooc_noNorm(sample5) > flashooc_noNorm(sample1)
+
+MultiModel gpu占用约等于4个LiDar

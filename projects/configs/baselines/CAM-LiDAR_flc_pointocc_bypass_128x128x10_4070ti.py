@@ -90,7 +90,7 @@ c2h_hidden_dim = 512
 
 model = dict(
     type='FLCPointOccNet',
-    loss_norm=False,
+    loss_norm=True,
     # ---- Bypass switches ----
     # Full camera-only bypass: extract_feat short-circuits cam_bev → occ_encoder.
     # Constructor also skips building every LiDAR / adapter / fuse module.
