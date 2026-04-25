@@ -52,8 +52,13 @@ class LidarPrepMixin:
                       coarse Cartesian voxel centre.
 
         Side effects:
-            Stores 10-channel padded point feature tensor on
-            `self._lidar_points_10ch` for `extract_lidar_tpv` to consume.
+            Stores flat concatenated 10-channel point feature tensor of shape
+            (sum N_i, 10) on `self._lidar_points_10ch` for `extract_lidar_tpv`
+            to consume.  Must NOT be padded to (B, max_n, 10): CylinderEncoder
+            reshapes points to (-1, 10) then pairs row-by-row with cat_pt_ind
+            (which only contains real points), so any padding rows would
+            silently overwrite later samples' features and drop their tail
+            points.
         """
         device = points[0].device if isinstance(points, list) else points.device
         min_bound = torch.tensor(self.cyl_min_bound, dtype=torch.float32, device=device)
@@ -101,11 +106,12 @@ class LidarPrepMixin:
             point_feats_list.append(point_feat)
 
         B = len(point_feats_list)
-        max_n = max(pf.shape[0] for pf in point_feats_list)
-        points_padded = torch.zeros(B, max_n, 10, device=device)
-        for i, pf in enumerate(point_feats_list):
-            points_padded[i, :pf.shape[0]] = pf
-        self._lidar_points_10ch = points_padded
+        # Flat concat (no padding). CylinderEncoder builds cat_pt_ind only from
+        # real points in grid_ind_list, then does cat_pt_fea = points.reshape(
+        # -1, 10) and pairs row-i of features with row-i of indices. Padding to
+        # (B, max_n, 10) would inject zero rows between batches and shift all
+        # later samples' features against their grid indices.
+        self._lidar_points_10ch = torch.cat(point_feats_list, dim=0)
 
         # Build coarse Cartesian voxel centres → cylindrical coords.
         pc_range = np.asarray(getattr(self, 'pc_range', self._DEFAULT_PC_RANGE))

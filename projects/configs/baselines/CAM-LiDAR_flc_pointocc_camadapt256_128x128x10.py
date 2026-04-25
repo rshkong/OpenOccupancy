@@ -230,6 +230,7 @@ model = dict(
     cyl_max_bound=[50.0, 3.14159265, 3.0],
     occ_grid_size=[128, 128, 10],
     occ_coarse_ratio=1,
+    pc_range=point_cloud_range,
     # ---- 2D Encoder backbone (post-fusion, narrow input) ----
     occ_encoder_backbone=dict(
         type='CustomResNet2D',

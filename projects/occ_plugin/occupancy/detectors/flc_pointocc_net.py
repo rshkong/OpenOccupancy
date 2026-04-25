@@ -63,6 +63,7 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
                  cyl_max_bound=None,
                  occ_grid_size=None,
                  occ_coarse_ratio=1,
+                 pc_range=None,
                  # Debug flags
                  debug_zero_lidar=False,
                  debug_camera_only_bypass=False,
@@ -131,6 +132,12 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
         self.occ_grid_size = np.array(occ_grid_size) if occ_grid_size is not None \
             else np.array([128, 128, 10])
         self.occ_coarse_ratio = occ_coarse_ratio
+        # LidarPrepMixin reads self.pc_range to build voxels_coarse; without
+        # this it silently falls back to hardcoded nuScenes defaults and any
+        # config-level pc_range change would desync TPV queries from occupancy
+        # grid. Mirror PointOccNet's behaviour.
+        if pc_range is not None:
+            self.pc_range = np.array(pc_range)
 
     # ------------------------------------------------------------------
     # Override extract_feat for dual-branch
@@ -216,8 +223,13 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
 
             lidar_feat = self.lidar_adapter(lidar_bev)
         else:
-            # Camera-only fallback: zero lidar features
-            lidar_feat = torch.zeros_like(cam_feat)
+            # Camera-only fallback: produce zeros with lidar_adapter's output
+            # channel count (e.g. 128), NOT cam_feat's channel count. cam_feat
+            # is 256/640 depending on cam_adapter; cat downstream requires
+            # lidar_feat to match fuse_conv.in_channels - cam_feat.shape[1].
+            B, _, H, W = cam_feat.shape
+            lidar_feat = cam_feat.new_zeros(
+                B, self.lidar_adapter.out_channels, H, W)
 
         # === Step 1 degrade switch: zero LiDAR → pure FlashOcc behaviour ===
         if self.debug_zero_lidar:
