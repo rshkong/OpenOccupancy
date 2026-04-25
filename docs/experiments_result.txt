@@ -65,4 +65,4 @@ Loaded checkpoint epoch: 10
 2026.4.26实验记录
 LiDAR_pointocc > LiDAR_baseline >> cam_baseline > flashocc(sample5) > flashooc_noNorm(sample5) > flashooc_noNorm(sample1)
 
-MultiModel gpu占用约等于4个LiDar
+MultiModel gpu占用约等于4个LiDar(pointocch和Lidarbaseline倒是差不多)

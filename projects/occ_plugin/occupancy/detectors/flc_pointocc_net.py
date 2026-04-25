@@ -5,22 +5,21 @@ Architecture
 Camera branch:
     img → img_backbone → img_neck → ViewTransformerLSSFlash
     → cam_bev [B, C*Dz, X, Y]  (e.g. [B, 640, 128, 128])
-    → cam_adapter  (Conv2d)
+    → cam_adapter  (Conv2d, optional)
     → [B, cam_out, X, Y]
 
 LiDAR branch:
     points → CylinderEncoder → TPVSwin → TPVFPN → tpv_list
     → TPVFuser (grid_sample fusion)
     → lidar_3d [B, C_tpv, X, Y, Z]  (e.g. [B, 192, 128, 128, 10])
-    → lidar_voxel_proj (Linear on C dim)
-    → flatten Z
-    → lidar_bev [B, C_proj*Z, X, Y]
-    → lidar_adapter (Conv2d)
+    → flatten Z into channels
+    → lidar_bev [B, C_tpv*Z, X, Y]   (e.g. [B, 1920, 128, 128])
+    → lidar_adapter (Conv2d, required)
     → [B, lidar_out, X, Y]
 
 Fusion:
     cat([cam_feat, lidar_feat], dim=1)
-    → fuse_conv (Conv2d + BN + ReLU)
+    → fuse_conv (Conv2d + BN + ReLU, BEVFusion-style 3x3)
     → [B, fused_out, X, Y]
     → occ_encoder_backbone → occ_encoder_neck → FLCOccHead
 """
@@ -50,14 +49,14 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
                  lidar_backbone=None,
                  lidar_neck=None,
                  tpv_fuser=None,
-                 # Channel adapters
+                 # Channel bookkeeping (used by lidar_adapter_cfg.in_channels)
                  lidar_proj_in=192,
-                 lidar_proj_out=64,
+                 lidar_proj_out=None,  # deprecated: ignored, kept for old-config compat
                  lidar_Dz=10,
                  cam_adapter_cfg=None,
                  lidar_adapter_cfg=None,
                  fuse_conv_cfg=None,
-                 fused_channels=640,
+                 fused_channels=256,
                  # Cylindrical grid params for data pipeline
                  cyl_grid_size=None,
                  cyl_min_bound=None,
@@ -88,7 +87,6 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
             self.lidar_backbone = None
             self.lidar_neck = None
             self.tpv_fuser = None
-            self.lidar_voxel_proj = None
             self.cam_adapter = None
             self.lidar_adapter = None
             self.fuse_conv = None
@@ -99,45 +97,29 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
             self.lidar_neck = builder.build_neck(lidar_neck)
             self.tpv_fuser = builder.build_fusion_layer(tpv_fuser)
 
-            # ---- Channel projection: reduce LiDAR C before Z-flatten ----
+            # Channel/Z bookkeeping; flatten Z first then 1x1 conv lets every
+            # height bin own its projection weights (vs Z-shared Linear).
             self.lidar_proj_in = lidar_proj_in
-            self.lidar_proj_out = lidar_proj_out
             self.lidar_Dz = lidar_Dz
-            self.lidar_voxel_proj = nn.Sequential(
-                nn.Linear(lidar_proj_in, lidar_proj_out),
-                nn.ReLU(inplace=True),
-            )
 
-            # ---- Adapters ----
-            lidar_bev_channels = lidar_proj_out * lidar_Dz  # e.g. 64*10=640
+            # ---- Camera adapter (optional) ----
             if cam_adapter_cfg is not None:
                 self.cam_adapter = ConvModule(**cam_adapter_cfg)
-                cam_out = cam_adapter_cfg['out_channels']
             else:
                 self.cam_adapter = None
-                cam_out = fused_channels
 
-            if lidar_adapter_cfg is not None:
-                self.lidar_adapter = ConvModule(**lidar_adapter_cfg)
-                lidar_out = lidar_adapter_cfg['out_channels']
-            else:
-                self.lidar_adapter = nn.Identity()
-                lidar_out = lidar_bev_channels
+            # ---- LiDAR adapter (required: must collapse 1920ch lidar_bev) ----
+            if lidar_adapter_cfg is None:
+                raise ValueError(
+                    'lidar_adapter_cfg is required when debug_camera_only_bypass=False; '
+                    'lidar_bev has C_tpv*Dz channels (e.g. 1920) and must be reduced.')
+            self.lidar_adapter = ConvModule(**lidar_adapter_cfg)
 
             # ---- Fusion conv: cat → project to backbone input channels ----
-            if fuse_conv_cfg is not None:
-                self.fuse_conv = ConvModule(**fuse_conv_cfg)
-            else:
-                self.fuse_conv = ConvModule(
-                    cam_out + lidar_out,
-                    fused_channels,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                    bias=False,
-                    norm_cfg=dict(type='BN'),
-                    act_cfg=dict(type='ReLU'),
-                )
+            if fuse_conv_cfg is None:
+                raise ValueError(
+                    'fuse_conv_cfg is required when debug_camera_only_bypass=False.')
+            self.fuse_conv = ConvModule(**fuse_conv_cfg)
 
         # ---- Cylindrical grid params (for voxels_coarse generation) ----
         self.cyl_grid_size = np.array(cyl_grid_size) if cyl_grid_size is not None \
@@ -226,16 +208,11 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
             lidar_3d = self.tpv_fuser(tpv_list, voxels_coarse)
             # lidar_3d: [B, C_tpv, X, Y, Z]
 
-            # Channel projection: [B, C_tpv, X, Y, Z] → [B, C_proj, X, Y, Z]
+            # Flatten Z first, then Conv1x1: each Z bin owns its projection
+            # weights (vs Linear-then-flatten which forces all Z to share).
             B, C, X, Y, Z = lidar_3d.shape
-            lidar_3d = lidar_3d.permute(0, 2, 3, 4, 1).contiguous()  # [B,X,Y,Z,C]
-            lidar_3d = self.lidar_voxel_proj(lidar_3d)  # [B,X,Y,Z,C_proj]
-            lidar_3d = lidar_3d.permute(0, 4, 1, 2, 3).contiguous()  # [B,C_proj,X,Y,Z]
-
-            # Flatten Z: [B, C_proj, X, Y, Z] → [B, C_proj*Z, X, Y]
-            B, C_proj, X, Y, Z = lidar_3d.shape
-            lidar_bev = lidar_3d.permute(0, 1, 4, 2, 3).contiguous()  # [B,C_proj,Z,X,Y]
-            lidar_bev = lidar_bev.reshape(B, C_proj * Z, X, Y)
+            lidar_bev = lidar_3d.permute(0, 1, 4, 2, 3).contiguous()  # [B,C,Z,X,Y]
+            lidar_bev = lidar_bev.reshape(B, C * Z, X, Y)            # [B,C*Z,X,Y]
 
             lidar_feat = self.lidar_adapter(lidar_bev)
         else:

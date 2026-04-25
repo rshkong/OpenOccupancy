@@ -40,7 +40,9 @@ bash run.sh projects/configs/baselines/CAM-R50_img256x704_flc_noNorm_128x128x10_
 
 ## 3. Camera + LiDAR: FLC-PointOcc 融合模型
 
-- Config: `projects/configs/baselines/CAM-LiDAR_flc_pointocc_128x128x10_4070ti.py`
+> 当前主推 §3d / §3e 两版（**Version A / B**）：LiDAR 配方对齐已验证的 LiDAR-only PointOcc，融合策略对齐 BEVFusion（concat + Conv3x3 + 256ch post-fusion），只在 cam 是否压缩这一处做消融。3a–3c 是历史调试路径，结论已经记录但训练中不再使用。
+
+- 旧 Config（仅作 bypass 用）：`projects/configs/baselines/CAM-LiDAR_flc_pointocc_128x128x10_4070ti.py`
 - 直接走单卡 `tools/train.py`（融合模型暂时单卡）
 
 ```bash
@@ -97,6 +99,60 @@ PYTHONPATH="./":$PYTHONPATH python tools/train.py \
 判读（对齐训练配方后才有意义）：
 - 实验 B 结果 ≈ FLC-step2 → `FLCPointOccNet` 的相机路径本身没问题，3a/3b 的下降是 bs=1 + SyncBN 造成的
 - 实验 B 结果仍 ≪ FLC-step2 → 问题在 `FLCPointOccNet.extract_feat` 本身（即使短路了也还有路径差异），下一步要 diff OccNet vs FLCPointOccNet 的 forward 细节
+
+### 3d. **Version A**：cam 压到 256（推荐，BEVFusion 范式，参数最小）
+
+- Config: `projects/configs/baselines/CAM-LiDAR_flc_pointocc_camadapt256_128x128x10.py`
+- 关键改动：cam_adapter Conv1x1 640→256；lidar 先 flatten Z 再 Conv1x1 1920→128；fuse_conv 用 **Conv3x3** 384→256；post-fusion `numC_input=256`；LiDAR 配方完全对齐 §4 的 LiDAR-only PointOcc（`cyl_grid=[480,360,32]`、`split=[8,8,8]`、Swin-T ImageNet 预训练、bs=4、lr=2e-4、24 epoch）。
+- `debug_camera_only_bypass=False`，跑真正的双模态融合。
+
+**前置：下载 Swin-T 预训练权重**（A/B 都需要）
+
+```bash
+mkdir -p pretrain
+wget -O pretrain/swin_tiny_patch4_window7_224.pth \
+    https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth
+```
+
+**多卡 DDP 训练（目标 effective batch = 8，2×4090 推荐）**
+
+```bash
+PYTHONPATH="./":$PYTHONPATH python -m torch.distributed.launch \
+    --nproc_per_node=2 tools/train.py \
+    projects/configs/baselines/CAM-LiDAR_flc_pointocc_camadapt256_128x128x10.py \
+    --work-dir work_dirs/CAM-LiDAR_flc_pointocc_camadapt256 \
+    --launcher pytorch --seed 0
+```
+
+**单卡 smoke test（手动改 `samples_per_gpu` 到 1）**
+
+```bash
+PYTHONPATH="./":$PYTHONPATH python tools/train.py \
+    projects/configs/baselines/CAM-LiDAR_flc_pointocc_camadapt256_128x128x10.py \
+    --work-dir work_dirs/_smoke_A --seed 0 --no-validate \
+    2>&1 | head -200
+```
+
+预期：日志里有 `load checkpoint from local path: pretrain/swin_tiny...`，第一个 iter loss 落地。
+
+### 3e. **Version B**：cam 保持 640，无 cam_adapter（消融对照）
+
+- Config: `projects/configs/baselines/CAM-LiDAR_flc_pointocc_camfull640_128x128x10.py`
+- 与 A 唯一不同：`cam_adapter_cfg=None`，cam_bev (640ch) 直接进 cat；fuse_conv 输入变 768→256（仍是 Conv3x3）。其他全部相同。
+
+```bash
+PYTHONPATH="./":$PYTHONPATH python -m torch.distributed.launch \
+    --nproc_per_node=2 tools/train.py \
+    projects/configs/baselines/CAM-LiDAR_flc_pointocc_camfull640_128x128x10.py \
+    --work-dir work_dirs/CAM-LiDAR_flc_pointocc_camfull640 \
+    --launcher pytorch --seed 0
+```
+
+判读（A vs B）：
+- A ≈ B（差距 < 0.01 SSC）→ cam 压不压都行，倾向 A（参数少、更接近 BEVFusion 范式）
+- A < B → 256 维 cam_adapter 丢信息，需放宽 cam 通道
+- A > B → fuse_conv 在 768 输入下不够宽，可放大或退回 A
+- 收敛后 SSC_mean ≥ §4 的 LiDAR-only PointOcc → 融合真有效
 
 ---
 
@@ -171,9 +227,10 @@ PYTHONPATH="./":$PYTHONPATH python tools/test.py \
 | FlashOcc (FLC step1) | `CAM-R50_img256x704_128x128x10_4070ti.py` | `run.sh ... 1` |
 | FLC step2 | `CAM-R50_img256x704_flc_step2_128x128x10_4070ti.py` | `run.sh ... 1` |
 | FLC noNorm | `CAM-R50_img256x704_flc_noNorm_128x128x10_4070ti.py` | `run.sh ... 1` |
-| FLC-PointOcc (fusion) | `CAM-LiDAR_flc_pointocc_128x128x10_4070ti.py` | `tools/train.py` |
-| FLC-PointOcc Degraded (zero LiDAR) | 同上 + `debug_zero_lidar=True` | `tools/train.py` |
-| FLC-PointOcc Bypass (沿用融合 config) | 同上 + `debug_camera_only_bypass=True` | `tools/train.py` |
+| **FLC-PointOcc Version A**（cam→256，推荐） | `CAM-LiDAR_flc_pointocc_camadapt256_128x128x10.py` | `tools/train.py` (DDP, 2×GPU) |
+| **FLC-PointOcc Version B**（cam=640） | `CAM-LiDAR_flc_pointocc_camfull640_128x128x10.py` | `tools/train.py` (DDP, 2×GPU) |
+| FLC-PointOcc 旧 fusion config（仅 bypass 用） | `CAM-LiDAR_flc_pointocc_128x128x10_4070ti.py` | `tools/train.py` |
+| FLC-PointOcc Degraded (zero LiDAR) | 旧 config + `debug_zero_lidar=True` | `tools/train.py` |
 | FLC-PointOcc Bypass-Only (实验 B，bs=5 对齐 step2) | `CAM-LiDAR_flc_pointocc_bypass_128x128x10_4070ti.py` | `tools/train.py` |
 | LiDAR-only PointOcc | `LiDAR_pointocc_128x128x10_4070ti.py` | `tools/train.py` |
 | 原始 LiDAR baseline | `LiDAR_128x128x10.py` | `run.sh ... 1` |
