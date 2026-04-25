@@ -360,7 +360,7 @@ train_config = dict(
 # If GPU count differs, rescale samples_per_gpu so eff bs stays at 8.
 data = dict(
     samples_per_gpu=4,
-    workers_per_gpu=2,
+    workers_per_gpu=8,
     train=train_config,
     val=test_config,
     test=test_config,
