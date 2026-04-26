@@ -141,11 +141,10 @@ PYTHONPATH="./":$PYTHONPATH python tools/train.py \
 - 与 A 唯一不同：`cam_adapter_cfg=None`，cam_bev (640ch) 直接进 cat；fuse_conv 输入变 768→256（仍是 Conv3x3）。其他全部相同。
 
 ```bash
-PYTHONPATH="./":$PYTHONPATH python -m torch.distributed.launch \
-    --nproc_per_node=2 tools/train.py \
+PYTHONPATH="./":$PYTHONPATH python tools/train.py \
     projects/configs/baselines/CAM-LiDAR_flc_pointocc_camfull640_128x128x10.py \
     --work-dir work_dirs/CAM-LiDAR_flc_pointocc_camfull640 \
-    --launcher pytorch --seed 0
+    --seed 0
 ```
 
 判读（A vs B）：

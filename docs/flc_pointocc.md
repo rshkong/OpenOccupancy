@@ -216,28 +216,26 @@ wget -O pretrain/swin_tiny_patch4_window7_224.pth \
 
 ### 3.2 启动训练
 
-两版 config 训练命令一致，只换 config 路径和 work-dir。**目标 effective batch = 8**（对齐 LiDAR-only PointOcc）：默认 `samples_per_gpu=4`，配合 `--nproc_per_node=2` 跑 2×4090，总 batch = 8。
+两版 config 训练命令一致，只换 config 路径和 work-dir。下面先给**单卡训练**版本，适合当前多卡训练还未稳定的情况。当前 config 默认 `samples_per_gpu=4`，因此单卡时 effective batch = 4；如果显存不足，手动把 `samples_per_gpu` 下调到 1 或 2。
 
 ```bash
 conda activate OpenOccupancy-4070
 cd /home/shkong/MyProject/OpenOccupancy
 
 # Version A：cam 压到 256
-PYTHONPATH="./":$PYTHONPATH python -m torch.distributed.launch \
-    --nproc_per_node=2 tools/train.py \
+PYTHONPATH="./":$PYTHONPATH python tools/train.py \
     projects/configs/baselines/CAM-LiDAR_flc_pointocc_camadapt256_128x128x10.py \
     --work-dir work_dirs/CAM-LiDAR_flc_pointocc_camadapt256 \
-    --launcher pytorch --seed 0
+    --seed 0
 
 # Version B：cam 保持 640
-PYTHONPATH="./":$PYTHONPATH python -m torch.distributed.launch \
-    --nproc_per_node=2 tools/train.py \
+PYTHONPATH="./":$PYTHONPATH python tools/train.py \
     projects/configs/baselines/CAM-LiDAR_flc_pointocc_camfull640_128x128x10.py \
     --work-dir work_dirs/CAM-LiDAR_flc_pointocc_camfull640 \
-    --launcher pytorch --seed 0
+    --seed 0
 ```
 
-GPU 数与 `samples_per_gpu` 不同时按 `samples_per_gpu × nproc = 8` 调整；偏离 8 时按 linear scaling 微调 `lr`（默认 2e-4）。
+后续如果多卡恢复正常，再把命令切回分布式版本，并按 `samples_per_gpu × nproc = 8` 对齐原计划的 effective batch；偏离 8 时按 linear scaling 微调 `lr`（默认 2e-4）。
 
 ### 3.3 单卡 smoke test（不依赖完整数据 / 调试用）
 
@@ -289,6 +287,7 @@ bash tools/dist_test.sh \
 - 默认 `samples_per_gpu=4` 针对 24GB 卡（4090）。12GB 卡（4070 Ti）下需降到 1，且可能仍 OOM —— 4070 Ti 不是融合训练的目标平台。
 - LiDAR 分支已开 `with_cp=True`（CylinderEncoder + Swin），相机 ResNet50 也是 `with_cp=True`。
 - `OccEfficiencyHook` 会 deepcopy 整个模型，浪费 ~400MB VRAM，已在 config 中禁用。
+- **`workers_per_gpu=2`**（不要随便调到 8）。每个 worker 进程会缓存 prefetch 队列里的 6 摄像头图像 + 10 sweep LiDAR + 512×512×40 occupancy GT，单 worker RES ≈ 4 GiB。`workers=8` 会让总 RAM 飙到 100–200 GiB（参照 LiDAR-only baseline `workers=2` 时稳定在 ~11 GiB）。
 
 ### 4.2 `loss_norm` 必须为 `False`
 
