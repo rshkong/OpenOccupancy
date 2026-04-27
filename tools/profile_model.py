@@ -515,19 +515,102 @@ def measure_train_memory(model, model_kind, cfg, device, batch_size, num_points)
 # FLOPs estimation
 # ---------------------------------------------------------------------------
 
-def estimate_flops(model, model_kind, cfg, device, batch_size, num_points):
-    """Estimate GFLOPs using torch.profiler (built-in, no extra deps).
+def _attach_sparse_conv_hooks(model):
+    """Register forward hooks on all spconv SubMConv3d / SparseConv3d layers.
 
-    torch.profiler with_flops=True counts flops for standard ops (conv, matmul,
-    etc.) but skips custom CUDA kernels like scatter_max in CylinderEncoder.
-    The returned number is therefore a lower bound for LiDAR-containing models.
+    For each layer the hook accumulates:
+        FLOPs = 2 * K_d * K_h * K_w * C_in * C_out * N_active_output
+
+    SubMConv keeps the same active set → N_active_output = N_active_input.
+    SparseConv (stride>1) generates a new active set read from output.features.
+
+    Returns (handles, counter_dict).  counter_dict['sparse_flops'] is updated
+    in-place during the forward pass.
+    """
+    try:
+        import spconv.pytorch as spconv_mod
+        sparse_types = (spconv_mod.SubMConv3d, spconv_mod.SparseConv3d)
+    except ImportError:
+        return [], {}
+
+    counter = {'sparse_flops': 0}
+    handles = []
+
+    def _hook(module, inputs, output):
+        # output is a SparseConvTensor; .features is [N_active, C_out]
+        n_active = output.features.shape[0]
+        k = module.kernel_size
+        k_vol = k[0] * k[1] * k[2] if isinstance(k, (list, tuple)) else k ** 3
+        flops = 2 * k_vol * module.in_channels * module.out_channels * n_active
+        counter['sparse_flops'] += flops
+
+    for m in model.modules():
+        if isinstance(m, sparse_types):
+            handles.append(m.register_forward_hook(_hook))
+
+    return handles, counter
+
+
+def _attach_cylinder_encoder_hooks(model):
+    """Register hooks on CylinderEncoder's point_mlp layers and track
+    scatter_max cost.
+
+    Since CylinderEncoder.forward() runs:
+      (1) point_mlp on all N_points  → Linear layers, already caught by profiler
+      (2) scatter_max: element-wise max over N_points → N_voxels   (2*N_points*C)
+      (3) per-plane mlp_xy/yz/zx on dense grids  → already caught by profiler
+
+    We capture the N_points seen at CylinderEncoder.forward and compute
+    scatter_max cost from there.
+
+    Returns (handles, counter_dict).
+    """
+    from projects.occ_plugin.occupancy.lidar_encoder.cylinder_encoder import CylinderEncoder
+
+    counter = {'scatter_flops': 0}
+    handles = []
+
+    def _fwd_hook(module, inputs, output):
+        # inputs[0] is points tensor of shape (B, N, C) or (N_total, C)
+        pts = inputs[0]
+        n_pts = pts.shape[0] * pts.shape[1] if pts.dim() == 3 else pts.shape[0]
+        last = module.point_mlp[-1]
+        c_out = (last.out_features if hasattr(last, 'out_features')
+                 else last.weight.shape[0])
+        # scatter_max: element-wise compare over N_pts per output channel → 2*N_pts*C_out
+        counter['scatter_flops'] += 2 * n_pts * c_out
+
+    for m in model.modules():
+        if isinstance(m, CylinderEncoder):
+            handles.append(m.register_forward_hook(_fwd_hook))
+
+    return handles, counter
+
+
+def estimate_flops(model, model_kind, cfg, device, batch_size, num_points):
+    """Estimate GFLOPs for all model types.
+
+    Strategy:
+    - torch.profiler(with_flops=True): counts standard dense ops (Conv2d/3d,
+      Linear, BatchNorm, etc.)
+    - _attach_sparse_conv_hooks: counts spconv SubMConv3d / SparseConv3d
+      using the active-voxel count read from the output SparseConvTensor
+    - _attach_cylinder_encoder_hooks: estimates scatter_max cost in
+      CylinderEncoder from point count
+
+    The combined total is a good-faith estimate. Remaining uncounted ops
+    (SparseMaxPool, index_add in TPV sampling) are typically < 5% of total.
+
     Returns GFLOPs (float) or None on failure.
     """
     import torch.profiler as tprof
 
     img_metas = [{} for _ in range(batch_size)]
-    # OccNet voxelization pipeline delivers 4-ch points after multi-sweep loading
     vfe_dim = get_vfe_point_dim(model) if model_kind in ('occnet_lidar', 'occnet_mm') else 5
+
+    # Attach hooks for sparse ops
+    sp_handles, sp_counter = _attach_sparse_conv_hooks(model)
+    cyl_handles, cyl_counter = _attach_cylinder_encoder_hooks(model)
 
     def _run():
         if model_kind == 'occnet_cam':
@@ -555,9 +638,11 @@ def estimate_flops(model, model_kind, cfg, device, batch_size, num_points):
             raise ValueError(f'Unknown model_kind: {model_kind}')
 
     try:
-        # One warmup pass so lazy CUDA inits don't pollute the count
+        # Warmup (hooks fire but we reset counters after)
         with torch.no_grad():
             _run()
+        sp_counter['sparse_flops'] = 0
+        cyl_counter['scatter_flops'] = 0
 
         with torch.no_grad():
             with tprof.profile(
@@ -568,12 +653,27 @@ def estimate_flops(model, model_kind, cfg, device, batch_size, num_points):
             ) as prof:
                 _run()
 
-        total_flops = sum(e.flops for e in prof.key_averages())
+        dense_flops = sum(e.flops for e in prof.key_averages())
+        sparse_flops = sp_counter['sparse_flops']
+        scatter_flops = cyl_counter['scatter_flops']
+        total_flops = dense_flops + sparse_flops + scatter_flops
+
+        if sparse_flops > 0 or scatter_flops > 0:
+            def _gf(x): return f'{x/1e9:.3f}' if x < 1e9 else f'{x/1e9:.1f}'
+            print(f'  dense (profiler) : {_gf(dense_flops)} GFLOPs')
+            print(f'  sparse conv hook : {_gf(sparse_flops)} GFLOPs')
+            if scatter_flops > 0:
+                print(f'  scatter_max hook : {_gf(scatter_flops)} GFLOPs')
+
         return total_flops / 1e9
 
     except Exception as e:
-        print(f'  [torch.profiler FLOPs failed: {e}]')
+        print(f'  [FLOPs estimation failed: {e}]')
         return None
+
+    finally:
+        for h in sp_handles + cyl_handles:
+            h.remove()
 
 
 # ---------------------------------------------------------------------------
@@ -670,9 +770,10 @@ def main():
         gflops = estimate_flops(model, model_kind, cfg, device,
                                 batch_size=1, num_points=args.num_points)
         if gflops is not None:
-            print(f'GFLOPs (batch=1)    : {gflops:.1f}')
+            gf_str = f'{gflops:.3f}' if gflops < 1.0 else f'{gflops:.1f}'
+            print(f'GFLOPs (batch=1)    : {gf_str}')
         else:
-            print('GFLOPs              : N/A (unsupported ops in LiDAR encoder)')
+            print('GFLOPs              : N/A')
 
     # ---- Training memory ----
     if args.train_mem:
