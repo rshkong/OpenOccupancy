@@ -360,7 +360,7 @@ train_config = dict(
 # If GPU count differs, rescale samples_per_gpu so eff bs stays at 8.
 data = dict(
     samples_per_gpu=4,
-    workers_per_gpu=8,
+    workers_per_gpu=2,
     train=train_config,
     val=test_config,
     test=test_config,
@@ -372,7 +372,7 @@ data = dict(
 # ResNet50 is ImageNet-pretrained (FLC-step2 convention).
 optimizer = dict(
     type='AdamW',
-    lr=2e-4,
+    lr=1e-4,
     paramwise_cfg=dict(
         custom_keys={'img_backbone': dict(lr_mult=0.1)}),
     weight_decay=0.01)
@@ -390,11 +390,11 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
 
-runner = dict(type='EpochBasedRunner', max_epochs=24)
+runner = dict(type='EpochBasedRunner', max_epochs=15)
 find_unused_parameters = False
 static_graph = True
 evaluation = dict(
-    interval=1,
+    interval=3,
     pipeline=test_pipeline,
     save_best='SSC_mean',
     rule='greater',
