@@ -155,6 +155,71 @@ PYTHONPATH="./":$PYTHONPATH python tools/train.py \
 
 ---
 
+### 3f. **Ablation — Zero LiDAR**：LiDAR 信号清零对照
+
+- Config: `projects/configs/baselines/CAM-LiDAR_flc_pointocc_zerol_128x128x10.py`
+- 继承自 Version A，唯一改动：`debug_zero_lidar=True`
+- LiDAR 分支（CylinderEncoder → TPVSwin → TPVFuser）**完整运行**，但 `lidar_feat` 在送入 `fuse_conv` 前被清零。cam_adapter / lidar_adapter / fuse_conv 路径仍然激活。
+- 用途：对照"融合路径本身是否阻塞相机信号"。若 mIoU ≈ FlashOcc 则融合路径通畅；若明显低于 FlashOcc 则 fuse_conv/adapter 引入了梯度干扰。
+
+```bash
+PYTHONPATH="./":$PYTHONPATH python -m torch.distributed.launch \
+    --nproc_per_node=2 tools/train.py \
+    projects/configs/baselines/CAM-LiDAR_flc_pointocc_zerol_128x128x10.py \
+    --work-dir work_dirs/CAM-LiDAR_flc_pointocc_zerol \
+    --launcher pytorch --seed 0
+```
+
+判读：
+- Zero LiDAR mIoU ≈ FlashOcc (6.9) → 融合路径不影响相机信号
+- Full FLC-PointOcc > Zero LiDAR → LiDAR TPV 特征带来了真实的几何增益
+
+---
+
+### 3g. **Ablation — Project-first Z strategy**：先线性投影再 flatten
+
+- Config: `projects/configs/baselines/CAM-LiDAR_flc_pointocc_projfirst_128x128x10.py`
+- 继承自 Version A，改动：`lidar_z_flatten_first=False`，`lidar_adapter.in_channels=640`
+- 默认 flatten-first：`[B,192,X,Y,Z]` → reshape `[B,1920,X,Y]` → Conv1×1（每个 Z bin 独立权重，~246K 参数）
+- 本变体 project-first：先对每个 Z bin 用**共享** `Linear(192→64)` 投影（~12K 参数），再 reshape 成 `[B,640,X,Y]` → Conv1×1
+- 用途：验证"每高度 bin 独立投影权重"是否比"所有 Z 共享投影"更好
+
+```bash
+PYTHONPATH="./":$PYTHONPATH python -m torch.distributed.launch \
+    --nproc_per_node=2 tools/train.py \
+    projects/configs/baselines/CAM-LiDAR_flc_pointocc_projfirst_128x128x10.py \
+    --work-dir work_dirs/CAM-LiDAR_flc_pointocc_projfirst \
+    --launcher pytorch --seed 0
+```
+
+判读：
+- Flatten-first > Project-first → 独立 Z 权重更优，地面/物体/高空语义分布差异被有效捕捉
+- Project-first ≈ Flatten-first → 共享投影足够，可选择参数更少的方案
+
+---
+
+### 3h. **Ablation — Point-wise (1×1) fusion convolution**：点卷积融合
+
+- Config: `projects/configs/baselines/CAM-LiDAR_flc_pointocc_fuse1x1_128x128x10.py`
+- 继承自 Version A，唯一改动：`fuse_conv_cfg.kernel_size=1, padding=0`
+- 默认 3×3：在融合点引入跨模态局部空间平滑，补偿相机深度不确定性和标定噪声
+- 本变体 1×1：逐像素点融合，无邻域交互
+- 用途：验证融合处的空间上下文（3×3 vs 1×1）是否带来提升
+
+```bash
+PYTHONPATH="./":$PYTHONPATH python -m torch.distributed.launch \
+    --nproc_per_node=2 tools/train.py \
+    projects/configs/baselines/CAM-LiDAR_flc_pointocc_fuse1x1_128x128x10.py \
+    --work-dir work_dirs/CAM-LiDAR_flc_pointocc_fuse1x1 \
+    --launcher pytorch --seed 0
+```
+
+判读：
+- 3×3 > 1×1 → 局部空间平滑有助于跨模态对齐
+- 3×3 ≈ 1×1 → 两模态对齐质量已经足够好，空间平滑作用有限
+
+---
+
 ## 4. LiDAR-only: PointOcc 复现（服务器版，对齐原版 recipe）
 
 - Config: `projects/configs/baselines/LiDAR_pointocc_128x128x10_4070ti.py`

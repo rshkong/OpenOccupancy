@@ -57,6 +57,17 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
                  lidar_adapter_cfg=None,
                  fuse_conv_cfg=None,
                  fused_channels=256,
+                 # Z-flatten strategy:
+                 #   True  (default) — flatten-first: reshape [B,C,X,Y,Z]→[B,C*Z,X,Y]
+                 #                     then Conv1x1; each Z bin gets own weights (~246K).
+                 #   False — project-first: apply a shared Linear C→proj_ch per Z bin
+                 #                     then flatten; all Z bins share the same weight (~12K).
+                 #                     lidar_adapter_cfg.in_channels must equal
+                 #                     lidar_adapter_proj_ch * lidar_Dz.
+                 lidar_z_flatten_first=True,
+                 # Number of channels to project to per Z bin when
+                 # lidar_z_flatten_first=False.  Ignored when True.
+                 lidar_z_proj_ch=64,
                  # Cylindrical grid params for data pipeline
                  cyl_grid_size=None,
                  cyl_min_bound=None,
@@ -79,6 +90,7 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
         #   adapters." When both flags are True, bypass takes precedence.
         self.debug_zero_lidar = debug_zero_lidar
         self.debug_camera_only_bypass = debug_camera_only_bypass
+        self.lidar_z_flatten_first = lidar_z_flatten_first
 
         if debug_camera_only_bypass:
             # Skip all fusion-path modules; extract_feat short-circuits
@@ -98,10 +110,16 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
             self.lidar_neck = builder.build_neck(lidar_neck)
             self.tpv_fuser = builder.build_fusion_layer(tpv_fuser)
 
-            # Channel/Z bookkeeping; flatten Z first then 1x1 conv lets every
-            # height bin own its projection weights (vs Z-shared Linear).
+            # Channel/Z bookkeeping
             self.lidar_proj_in = lidar_proj_in
             self.lidar_Dz = lidar_Dz
+
+            # Project-first path: one Linear shared across all Z bins.
+            # lidar_adapter_cfg.in_channels should be lidar_z_proj_ch * lidar_Dz.
+            if not lidar_z_flatten_first:
+                self.lidar_z_proj = nn.Linear(lidar_proj_in, lidar_z_proj_ch, bias=False)
+            else:
+                self.lidar_z_proj = None
 
             # ---- Camera adapter (optional) ----
             if cam_adapter_cfg is not None:
@@ -215,11 +233,20 @@ class FLCPointOccNet(LidarPrepMixin, OccNet):
             lidar_3d = self.tpv_fuser(tpv_list, voxels_coarse)
             # lidar_3d: [B, C_tpv, X, Y, Z]
 
-            # Flatten Z first, then Conv1x1: each Z bin owns its projection
-            # weights (vs Linear-then-flatten which forces all Z to share).
             B, C, X, Y, Z = lidar_3d.shape
-            lidar_bev = lidar_3d.permute(0, 1, 4, 2, 3).contiguous()  # [B,C,Z,X,Y]
-            lidar_bev = lidar_bev.reshape(B, C * Z, X, Y)            # [B,C*Z,X,Y]
+            if self.lidar_z_flatten_first:
+                # Default: flatten Z into channels first, then Conv1x1.
+                # Each Z bin has its own projection weights (~246K params).
+                lidar_bev = lidar_3d.permute(0, 1, 4, 2, 3).contiguous()  # [B,C,Z,X,Y]
+                lidar_bev = lidar_bev.reshape(B, C * Z, X, Y)              # [B,C*Z,X,Y]
+            else:
+                # Project-first: shared Linear C→proj_ch across all Z bins (~12K params).
+                # lidar_3d: [B,C,X,Y,Z] → [B*X*Y*Z, C] → Linear → [B*X*Y*Z, proj_ch]
+                # → [B, proj_ch*Z, X, Y]
+                lidar_bev = lidar_3d.permute(0, 2, 3, 4, 1).contiguous()  # [B,X,Y,Z,C]
+                lidar_bev = self.lidar_z_proj(lidar_bev)                   # [B,X,Y,Z,proj_ch]
+                lidar_bev = lidar_bev.permute(0, 4, 3, 1, 2).contiguous() # [B,proj_ch,Z,X,Y]
+                lidar_bev = lidar_bev.reshape(B, -1, X, Y)                 # [B,proj_ch*Z,X,Y]
 
             lidar_feat = self.lidar_adapter(lidar_bev)
         else:
