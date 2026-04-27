@@ -481,67 +481,62 @@ def measure_train_memory(model, model_kind, cfg, device, batch_size, num_points)
 # ---------------------------------------------------------------------------
 
 def estimate_flops(model, model_kind, cfg, device, batch_size, num_points):
-    """Try fvcore then thop. Returns GFLOPs or None on failure."""
-    # Build inputs for fvcore (expects tuple/single arg)
-    try:
-        from fvcore.nn import FlopCountAnalysis
+    """Estimate GFLOPs using torch.profiler (built-in, no extra deps).
 
-        img_metas = [{} for _ in range(batch_size)]
+    torch.profiler with_flops=True counts flops for standard ops (conv, matmul,
+    etc.) but skips custom CUDA kernels like scatter_max in CylinderEncoder.
+    The returned number is therefore a lower bound for LiDAR-containing models.
+    Returns GFLOPs (float) or None on failure.
+    """
+    import torch.profiler as tprof
 
+    img_metas = [{} for _ in range(batch_size)]
+
+    def _run():
         if model_kind == 'occnet_cam':
             img_inputs, _ = build_cam_inputs(cfg, device, batch_size)
-            flops = FlopCountAnalysis(model.forward_dummy,
-                                      (None, img_metas, img_inputs))
+            model.forward_dummy(points=None, img_metas=img_metas,
+                                img_inputs=img_inputs)
         elif model_kind == 'occnet_lidar':
             points = build_lidar_points(batch_size, num_points, device)
-            flops = FlopCountAnalysis(model.forward_dummy,
-                                      (points, img_metas, None))
+            model.forward_dummy(points=points, img_metas=img_metas,
+                                img_inputs=None)
         elif model_kind == 'occnet_mm':
             img_inputs, _ = build_cam_inputs(cfg, device, batch_size)
             points = build_lidar_points(batch_size, num_points, device)
-            flops = FlopCountAnalysis(model.forward_dummy,
-                                      (points, img_metas, img_inputs))
+            model.forward_dummy(points=points, img_metas=img_metas,
+                                img_inputs=img_inputs)
         elif model_kind == 'pointocc':
             points = build_lidar_points(batch_size, num_points, device)
-            flops = FlopCountAnalysis(model.extract_feat,
-                                      (points, img_metas))
+            model.extract_feat(points=points, img_metas=img_metas)
         elif model_kind == 'flc_pointocc':
             img_inputs, _ = build_cam_inputs(cfg, device, batch_size)
             points = build_lidar_points(batch_size, num_points, device)
-            flops = FlopCountAnalysis(model.forward_dummy,
-                                      (points, img_metas, img_inputs))
+            model.forward_dummy(points=points, img_metas=img_metas,
+                                img_inputs=img_inputs)
         else:
-            return None
+            raise ValueError(f'Unknown model_kind: {model_kind}')
 
-        flops.unsupported_ops_warnings(False)
-        flops.uncalled_modules_warnings(False)
-        total = flops.total()
-        return total / 1e9
-
-    except Exception as e:
-        print(f'  [fvcore failed: {e}]')
-
-    # Fallback: thop
     try:
-        from thop import profile as thop_profile
+        # One warmup pass so lazy CUDA inits don't pollute the count
+        with torch.no_grad():
+            _run()
 
-        if model_kind == 'occnet_cam':
-            img_inputs, img_metas2 = build_cam_inputs(cfg, device, batch_size)
-            macs, _ = thop_profile(model, inputs=(None, img_metas2, img_inputs),
-                                   verbose=False)
-        elif model_kind == 'pointocc':
-            points = build_lidar_points(batch_size, num_points, device)
-            img_metas2 = [{} for _ in range(batch_size)]
-            macs, _ = thop_profile(model.extract_feat,
-                                   inputs=(points, img_metas2), verbose=False)
-        else:
-            return None
-        return macs / 1e9  # thop returns MACs, report as GFLOPs (≈ 2× MACs, but conventional)
+        with torch.no_grad():
+            with tprof.profile(
+                activities=[tprof.ProfilerActivity.CUDA,
+                            tprof.ProfilerActivity.CPU],
+                with_flops=True,
+                record_shapes=False,
+            ) as prof:
+                _run()
+
+        total_flops = sum(e.flops for e in prof.key_averages())
+        return total_flops / 1e9
 
     except Exception as e:
-        print(f'  [thop failed: {e}]')
-
-    return None
+        print(f'  [torch.profiler FLOPs failed: {e}]')
+        return None
 
 
 # ---------------------------------------------------------------------------
