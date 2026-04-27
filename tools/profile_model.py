@@ -153,9 +153,40 @@ def build_cam_inputs(cfg, device, batch_size, num_cams_override=None):
     return img_inputs, img_metas
 
 
-def build_lidar_points(batch_size, num_points, device):
-    """Build a dummy list of raw LiDAR point clouds [x, y, z, intensity, ring]."""
-    return [torch.randn(num_points, 5, device=device) for _ in range(batch_size)]
+def build_lidar_points(batch_size, num_points, device, point_dim=5):
+    """Build a dummy list of raw LiDAR point clouds.
+
+    point_dim should match what the model's VFE actually receives from the
+    data pipeline.  For OccNet-based models that use HardSimpleVFE, the real
+    pipeline runs LoadPointsFromMultiSweeps(use_dim=[0,1,2,4]) which produces
+    4-channel points even though LoadPointsFromFile loads 5 channels.
+    Pass point_dim=4 for those models to avoid a channel-size mismatch in
+    SparseLiDAREnc8x(input_channel=4).
+    """
+    return [torch.randn(num_points, point_dim, device=device) for _ in range(batch_size)]
+
+
+def get_vfe_point_dim(model):
+    """Return the number of point features expected by the model's VFE.
+
+    HardSimpleVFE slices features[:, :, :num_features], so the effective
+    output channel count equals min(num_features, actual_point_dim).
+    SparseLiDAREnc8x.input_channel is what the sparse encoder actually needs.
+    We read input_channel directly as the authoritative value.
+    """
+    enc = getattr(model, 'pts_middle_encoder', None)
+    if enc is not None:
+        # SparseLiDAREnc8x stores input_channel as the first conv's in_channels
+        conv_input = getattr(enc, 'conv_input', None)
+        if conv_input is not None:
+            for m in conv_input.modules():
+                if hasattr(m, 'in_channels'):
+                    return m.in_channels
+    # Fallback: try VFE num_features
+    vfe = getattr(model, 'pts_voxel_encoder', None)
+    if vfe is not None and hasattr(vfe, 'num_features'):
+        return vfe.num_features
+    return 5
 
 
 def build_gt_occ(batch_size, occ_grid=(512, 512, 40), device='cuda'):
@@ -434,6 +465,10 @@ def measure_train_memory(model, model_kind, cfg, device, batch_size, num_points)
     img_metas = [{} for _ in range(batch_size)]
     occ_gt = build_gt_occ(batch_size, occ_grid=(512, 512, 40), device=device)
 
+    # OccNet-based voxelization pipeline delivers 4-ch points (x,y,z,time) after
+    # LoadPointsFromMultiSweeps(use_dim=[0,1,2,4]), not 5-ch raw points.
+    vfe_dim = get_vfe_point_dim(model) if model_kind in ('occnet_lidar', 'occnet_mm') else 5
+
     if model_kind in ('occnet_cam', 'occnet_lidar', 'occnet_mm'):
         img_inputs = None
         points = None
@@ -441,7 +476,7 @@ def measure_train_memory(model, model_kind, cfg, device, batch_size, num_points)
         if model_kind in ('occnet_cam', 'occnet_mm'):
             img_inputs, _ = build_cam_inputs(cfg, device, batch_size)
         if model_kind in ('occnet_lidar', 'occnet_mm'):
-            points = build_lidar_points(batch_size, num_points, device)
+            points = build_lidar_points(batch_size, num_points, device, point_dim=vfe_dim)
 
         loss_dict = model.forward_train(
             points=points,
@@ -491,6 +526,8 @@ def estimate_flops(model, model_kind, cfg, device, batch_size, num_points):
     import torch.profiler as tprof
 
     img_metas = [{} for _ in range(batch_size)]
+    # OccNet voxelization pipeline delivers 4-ch points after multi-sweep loading
+    vfe_dim = get_vfe_point_dim(model) if model_kind in ('occnet_lidar', 'occnet_mm') else 5
 
     def _run():
         if model_kind == 'occnet_cam':
@@ -498,12 +535,12 @@ def estimate_flops(model, model_kind, cfg, device, batch_size, num_points):
             model.forward_dummy(points=None, img_metas=img_metas,
                                 img_inputs=img_inputs)
         elif model_kind == 'occnet_lidar':
-            points = build_lidar_points(batch_size, num_points, device)
+            points = build_lidar_points(batch_size, num_points, device, point_dim=vfe_dim)
             model.forward_dummy(points=points, img_metas=img_metas,
                                 img_inputs=None)
         elif model_kind == 'occnet_mm':
             img_inputs, _ = build_cam_inputs(cfg, device, batch_size)
-            points = build_lidar_points(batch_size, num_points, device)
+            points = build_lidar_points(batch_size, num_points, device, point_dim=vfe_dim)
             model.forward_dummy(points=points, img_metas=img_metas,
                                 img_inputs=img_inputs)
         elif model_kind == 'pointocc':
@@ -552,12 +589,14 @@ def run_one(model_kind, model, cfg, device, batch_size, num_cams, num_points,
         return profile_occnet_cam(model, img_inputs, img_metas, mode, time_meter, mem_meter)
 
     elif model_kind == 'occnet_lidar':
-        points = build_lidar_points(batch_size, num_points, device)
+        vfe_dim = get_vfe_point_dim(model)
+        points = build_lidar_points(batch_size, num_points, device, point_dim=vfe_dim)
         return profile_occnet_lidar(model, points, img_metas, mode, time_meter, mem_meter)
 
     elif model_kind == 'occnet_mm':
         img_inputs, img_metas = build_cam_inputs(cfg, device, batch_size, num_cams)
-        points = build_lidar_points(batch_size, num_points, device)
+        vfe_dim = get_vfe_point_dim(model)
+        points = build_lidar_points(batch_size, num_points, device, point_dim=vfe_dim)
         return profile_occnet_mm(model, img_inputs, img_metas, points, mode, time_meter, mem_meter)
 
     elif model_kind == 'pointocc':
