@@ -122,7 +122,12 @@ def detect_model_kind(model):
 # ---------------------------------------------------------------------------
 
 def build_cam_inputs(cfg, device, batch_size, num_cams_override=None):
-    """Build dummy camera tensor list [img, rots, trans, intrins, ...].
+    """Build dummy camera tensor list matching the 10-element img_inputs format:
+    [img, rots, trans, intrins, post_rots, post_trans, bda, img_hw,
+     gt_depths, sensor2sensors]
+
+    gt_depths  [B, N, H, W] zeros — depth loss will be near-zero but won't crash.
+    sensor2sensors [B, N, 4, 4] identity — only used by sequential-mode models.
 
     Returns (img_inputs, img_metas).
     """
@@ -147,8 +152,13 @@ def build_cam_inputs(cfg, device, batch_size, num_cams_override=None):
         torch.full((b,), h, device=device, dtype=torch.float32),
         torch.full((b,), w, device=device, dtype=torch.float32),
     ], dim=0)
+    # gt_depths: zeros → get_depth_loss still runs but loss is zero
+    gt_depths = torch.zeros(b, n, h, w, device=device)
+    # sensor2sensors: identity 4×4 per camera (used by sequential-mode only)
+    sensor2sensors = torch.eye(4, device=device).view(1, 1, 4, 4).repeat(b, n, 1, 1)
 
-    img_inputs = [img, rots, trans, intrins, post_rots, post_trans, bda, img_hw]
+    img_inputs = [img, rots, trans, intrins, post_rots, post_trans,
+                  bda, img_hw, gt_depths, sensor2sensors]
     img_metas = [{} for _ in range(b)]
     return img_inputs, img_metas
 
