@@ -228,81 +228,136 @@ bash tools/dist_test.sh projects/configs/baselines/CAM-R50_img256x704_128x128x10
 
 ---
 
-### 5. 如何对模型做前向推理性能分析（耗时 / 显存）
+### 5. 如何对模型做性能分析（参数量 / FLOPs / FPS / 显存）
 
-使用 `tools/profile_model.py` 脚本，对模型做纯推理 profiling，输出每个子模块的平均耗时和显存占用情况，不需要真实数据集，用随机 dummy 输入即可。
+使用 `tools/profile_model.py` 脚本，支持项目中全部五种模型路径（OccNet-Camera、OccNet-LiDAR、OccNet-Multimodal、PointOccNet、FLCPointOccNet），用随机 dummy 输入测量推理耗时、显存，以及训练显存。脚本自动识别模型类型，无需手动指定。
 
 **通用命令格式：**
 ```bash
 python tools/profile_model.py [--config <配置文件>] [--checkpoint <权重文件>] [可选参数]
 ```
 
-**常用参数说明：**
+**参数说明：**
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--config` | FLC-Occ Step2 config | 模型配置文件路径 |
-| `--checkpoint` | FLC-Occ latest.pth | 权重文件路径 |
+| `--config` | FlashOcc step2 config | 模型配置文件路径 |
+| `--checkpoint` | `''` | 权重文件路径（留空则用随机初始化） |
 | `--mode` | `full` | `extract`：只跑到 occ encoder；`full`：跑到 occ head 输出 |
-| `--warmup` | `10` | 预热帧数，不计入统计（让 CUDA 进入稳定状态） |
-| `--measure` | `50` | 正式统计帧数，越大结果越稳定 |
+| `--warmup` | `10` | 预热帧数，不计入统计 |
+| `--measure` | `50` | 正式统计帧数 |
 | `--batch-size` | `1` | batch size |
-| `--seed` | `0` | 随机种子，保证 dummy 输入可复现 |
+| `--num-points` | `20000` | 每帧 dummy LiDAR 点数（LiDAR/融合模型适用） |
+| `--seed` | `0` | 随机种子 |
+| `--params` | flag | 只打印参数量后退出，不做前向推理 |
+| `--flops` | flag | 估算 GFLOPs（需安装 fvcore 或 thop） |
+| `--train-mem` | flag | 测量训练峰值显存（forward + backward） |
+
+---
 
 **实际调用示例：**
 
-**① 快速测试 FLC-Occ Step2 的推理性能（默认参数）**
+**① 仅查看参数量（所有模型通用，几秒完成）**
 ```bash
-python tools/profile_model.py
-```
-
-**② 测试指定 checkpoint，减少 measure 次数快速得到结果**
-```bash
+# FlashOcc
 python tools/profile_model.py \
-    --checkpoint work_dirs/CAM-R50_img256x704_flc_step2_128x128x10_4070ti/best_SSC_mean_epoch_15.pth \
-    --warmup 5 --measure 20
+    --config projects/configs/baselines/CAM-R50_img256x704_flc_step2_128x128x10_4070ti.py \
+    --checkpoint work_dirs/CAM-R50_img256x704_flc_step2_128x128x10_4070ti/best_SSC_mean.pth \
+    --params
+
+# FLC-PointOcc A（双模态融合）
+python tools/profile_model.py \
+    --config projects/configs/baselines/CAM-LiDAR_flc_pointocc_camadapt256_128x128x10.py \
+    --checkpoint work_dirs/CAM-LiDAR_flc_pointocc_camadapt256/best_SSC_mean.pth \
+    --params
 ```
 
-**③ 只测到 occ encoder（不跑 head），对比 BEV 特征提取的瓶颈**
+**② 推理速度 + 推理显存（标准论文数据）**
 ```bash
-python tools/profile_model.py --mode extract --measure 20
-```
-
-**④ 测试原版 baseline 的推理性能做对比**
-```bash
+# Cam-OO (相机 baseline)
 python tools/profile_model.py \
     --config projects/configs/baselines/CAM-R50_img256x704_128x128x10_4070ti.py \
-    --checkpoint work_dirs/cam_r50_256x704/latest.pth \
-    --warmup 5 --measure 20
+    --checkpoint work_dirs/cam_r50_256x704/best_SSC_mean.pth \
+    --warmup 10 --measure 50
+
+# LiDAR-OO（无相机输入，自动构建 LiDAR dummy 点云）
+python tools/profile_model.py \
+    --config projects/configs/baselines/LiDAR_128x128x10.py \
+    --checkpoint work_dirs/LiDAR_128x128x10/best_SSC_mean.pth \
+    --warmup 10 --measure 50
+
+# PointOcc（LiDAR-only TPV，无 record_time，自动适配）
+python tools/profile_model.py \
+    --config projects/configs/baselines/LiDAR_pointocc_128x128x10_server.py \
+    --checkpoint work_dirs/LiDAR_pointocc_server4090x2/best_SSC_mean.pth \
+    --warmup 10 --measure 50
+
+# FLC-PointOcc A（双模态，包含 cam_adapter + lidar_tpv + fusion 各 stage）
+python tools/profile_model.py \
+    --config projects/configs/baselines/CAM-LiDAR_flc_pointocc_camadapt256_128x128x10.py \
+    --checkpoint work_dirs/CAM-LiDAR_flc_pointocc_camadapt256/best_SSC_mean.pth \
+    --warmup 10 --measure 50
 ```
 
-**输出说明：**
+**③ 训练显存（batch=4，和论文训练设置一致）**
+```bash
+python tools/profile_model.py \
+    --config projects/configs/baselines/CAM-LiDAR_flc_pointocc_camadapt256_128x128x10.py \
+    --checkpoint work_dirs/CAM-LiDAR_flc_pointocc_camadapt256/best_SSC_mean.pth \
+    --train-mem --batch-size 4
+```
+
+**④ GFLOPs 估算（需安装 fvcore）**
+```bash
+pip install fvcore   # 首次安装
+
+python tools/profile_model.py \
+    --config projects/configs/baselines/CAM-R50_img256x704_flc_step2_128x128x10_4070ti.py \
+    --checkpoint work_dirs/CAM-R50_img256x704_flc_step2_128x128x10_4070ti/best_SSC_mean.pth \
+    --flops
+```
+
+> **注意**：LiDAR 分支中的 `scatter_max`（CylinderEncoder）为稀疏算子，fvcore 无法统计，GFLOPs 为下界估计，在论文中需加注脚说明。
+
+---
+
+**输出格式说明：**
 
 ```
+Detected model kind : flc_pointocc  (FLCPointOccNet)
+Total params        : XX.XX M
+Trainable params    : XX.XX M
+
 ========================================================================
-Pure Forward Profiling (image -> occupancy logits)
-avg forward : XX.XX ms        ← 端到端平均耗时
-fps         : X.XX            ← 理论帧率
-peak memory : X.XX GB         ← 推理过程峰值显存
+Forward Inference Profiling
+  avg forward : XX.XX ms
+  FPS         : X.XX            ← 论文 FPS 列
+  Infer peak  : XXX.X MiB       ← 论文推理显存列
+========================================================================
 
-Stage                Avg Time (ms)     Share
+Stage                  Avg Time (ms)   Share
 ------------------------------------------------
-img_encoder              XX.XX         XX.X%   ← 图像骨干 + FPN
-view_transformer         XX.XX         XX.X%   ← LSS Lift-Splat + 深度估计
-occ_encoder              XX.XX         XX.X%   ← BEV backbone + FPN_LSS
-occ_head                 XX.XX         XX.X%   ← Conv2d + C2H MLP
+img_encoder                 XX.XX      XX.X%   ← ResNet50 + SECONDFPN
+view_transformer            XX.XX      XX.X%   ← LSS + 深度估计
+cam_adapter                 XX.XX      XX.X%   ← Conv1x1 640→256 (A版有, B版无)
+lidar_tpv                   XX.XX      XX.X%   ← CylinderEnc + Swin + TPVFuser
+lidar_adapter               XX.XX      XX.X%   ← Conv1x1 1920→128
+fusion                      XX.XX      XX.X%   ← Conv3x3 BN ReLU
+occ_encoder                 XX.XX      XX.X%   ← CustomResNet2D + FPN_LSS
+occ_head                    XX.XX      XX.X%   ← FLCOccHead (C2H MLP)
 
-Stage                Alloc Delta     Stage Peak Delta      Alloc After
-------------------------------------------------------------------------
-img_encoder            X.XX GB            X.XX GB           X.XX GB
-view_transformer       X.XX GB            X.XX GB           X.XX GB
-occ_encoder            X.XX GB            X.XX GB           X.XX GB
-occ_head               X.XX GB            X.XX GB           X.XX GB
+Stage                  Alloc Δ    Stage Peak Δ        After
+----------------------------------------------------------------
+img_encoder            X.XX MiB      X.XX MiB      X.XX MiB
+...
 ```
 
-*   **Avg Time / Share**：每个模块的平均耗时和占总耗时的比例，用于定位时间瓶颈。
-*   **Alloc Delta**：该阶段净分配的显存（正值 = 分配，负值 = 释放）。
-*   **Stage Peak Delta**：该阶段内峰值显存相对阶段开始时的增量，反映该模块的最大显存需求。
-*   **Alloc After**：该阶段结束后的显存占用绝对值。
+各 stage 因模型类型不同而有所差异：
+- **OccNet-Camera**（Cam-OO, FlashOcc）：`img_encoder → view_transformer → occ_encoder → occ_head`
+- **OccNet-LiDAR**（LiDAR-OO）：`pts_encoder → occ_encoder → occ_head`
+- **OccNet-Multimodal**（MM-OO）：`img_encoder → view_transformer → pts_encoder → occ_fuser → occ_encoder → occ_head`
+- **PointOccNet**（PointOcc）：`lidar_tpv → tpv_aggregator`
+- **FLCPointOccNet**（FLC-PointOcc A/B）：`img_encoder → view_transformer → cam_adapter → lidar_tpv → lidar_adapter → fusion → occ_encoder → occ_head`（cam_adapter 在 B 版本中不存在）
 
+完整的论文数据收集流程见 `docs/evaluation_cheatsheet.md`。
 
